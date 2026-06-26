@@ -308,6 +308,6 @@ add_test(NAME transformer_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 add_test(NAME decoder_test
-    COMMAND test_decoder
+    COMMAND test_decoder --tokenizer models/qwen3-tts-tokenizer-f16.gguf --codes reference/det_speech_codes.bin --reference reference/det_decoded_audio.bin
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )

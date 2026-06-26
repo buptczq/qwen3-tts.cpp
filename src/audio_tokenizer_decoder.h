@@ -16,6 +16,18 @@ namespace decoder_internal {
 struct ops;
 }
 
+struct audio_decoder_timing {
+    int64_t graph_build_ms = 0;
+    int64_t graph_alloc_ms = 0;
+    int64_t input_upload_ms = 0;
+    int64_t graph_compute_ms = 0;
+    int64_t output_read_ms = 0;
+    int64_t total_ms = 0;
+    int32_t graph_rebuilt = 0;
+    int32_t n_frames = 0;
+    int64_t n_samples = 0;
+};
+
 // Audio tokenizer decoder (vocoder) configuration
 struct audio_decoder_config {
     int32_t sample_rate = 24000;
@@ -56,6 +68,8 @@ public:
     const audio_decoder_config & get_config() const;
     
     const std::string & get_error() const;
+
+    const audio_decoder_timing & get_last_timing() const;
     
 private:
     friend struct decoder_internal::ops;

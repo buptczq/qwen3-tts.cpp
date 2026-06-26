@@ -1,9 +1,20 @@
 #include "audio_tokenizer_decoder.h"
 #include "decoder/decoder_state_internal.h"
 
+#include <chrono>
 #include <cstdio>
 
 namespace qwen3_tts {
+
+namespace {
+
+int64_t now_ms() {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        clock::now().time_since_epoch()).count();
+}
+
+} // namespace
 
 void decoder_internal::ops::release_cached_decode_graph(AudioTokenizerDecoder & self) {
     auto & state = self.impl_->state;
@@ -31,7 +42,10 @@ bool decoder_internal::ops::ensure_cached_decode_graph(AudioTokenizerDecoder & s
 
     release_cached_decode_graph(self);
 
+    const int64_t t_build_start = now_ms();
     state.decode_graph = build_graph_impl(self, n_frames, &state.decode_graph_ctx);
+    self.impl_->last_timing.graph_build_ms += now_ms() - t_build_start;
+    self.impl_->last_timing.graph_rebuilt = 1;
     if (!state.decode_graph || !state.decode_graph_ctx) {
         error_msg = "Failed to build cached decoder graph";
         release_cached_decode_graph(self);

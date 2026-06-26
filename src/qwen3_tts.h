@@ -91,6 +91,16 @@ struct tts_result {
     int64_t t_decode_ms = 0;
     int64_t t_total_ms = 0;
 
+    // Decoder timing breakdown (milliseconds)
+    int64_t t_decode_graph_build_ms = 0;
+    int64_t t_decode_graph_alloc_ms = 0;
+    int64_t t_decode_input_upload_ms = 0;
+    int64_t t_decode_graph_compute_ms = 0;
+    int64_t t_decode_output_read_ms = 0;
+    int32_t decode_graph_rebuilt = 0;
+    int32_t decode_frames = 0;
+    int64_t decode_samples = 0;
+
     // Process memory snapshots (bytes)
     uint64_t mem_rss_start_bytes = 0;
     uint64_t mem_rss_end_bytes = 0;

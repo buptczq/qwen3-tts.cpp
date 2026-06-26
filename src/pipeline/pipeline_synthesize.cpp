@@ -546,6 +546,15 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
         result.error_msg = "Failed to decode speech codes: " + self.audio_decoder_.get_error();
         return result;
     }
+    const audio_decoder_timing & decoder_timing = self.audio_decoder_.get_last_timing();
+    result.t_decode_graph_build_ms = decoder_timing.graph_build_ms;
+    result.t_decode_graph_alloc_ms = decoder_timing.graph_alloc_ms;
+    result.t_decode_input_upload_ms = decoder_timing.input_upload_ms;
+    result.t_decode_graph_compute_ms = decoder_timing.graph_compute_ms;
+    result.t_decode_output_read_ms = decoder_timing.output_read_ms;
+    result.decode_graph_rebuilt = decoder_timing.graph_rebuilt;
+    result.decode_frames = decoder_timing.n_frames;
+    result.decode_samples = decoder_timing.n_samples;
     if (reference_codes_ptr) {
         const int64_t cut = decoder_frames > 0
             ? (int64_t) ((double) reference_codes_ptr->n_frames /
@@ -583,6 +592,15 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
         fprintf(stderr, "  Speaker encode:  %lld ms\n", (long long) result.t_encode_ms);
         fprintf(stderr, "  Code generation: %lld ms\n", (long long) result.t_generate_ms);
         fprintf(stderr, "  Vocoder decode:  %lld ms\n", (long long) result.t_decode_ms);
+        fprintf(stderr, "    graph build:   %lld ms%s\n",
+                (long long) result.t_decode_graph_build_ms,
+                result.decode_graph_rebuilt ? " (rebuilt)" : " (cached)");
+        fprintf(stderr, "    graph alloc:   %lld ms\n", (long long) result.t_decode_graph_alloc_ms);
+        fprintf(stderr, "    input upload:  %lld ms\n", (long long) result.t_decode_input_upload_ms);
+        fprintf(stderr, "    graph compute: %lld ms\n", (long long) result.t_decode_graph_compute_ms);
+        fprintf(stderr, "    output read:   %lld ms\n", (long long) result.t_decode_output_read_ms);
+        fprintf(stderr, "    frames/samples:%d / %lld\n",
+                result.decode_frames, (long long) result.decode_samples);
         fprintf(stderr, "  Total:           %lld ms\n", (long long) result.t_total_ms);
         fprintf(stderr, "  Audio duration:  %.2f s\n", audio_sec);
         fprintf(stderr, "  Throughput:      %.2fx realtime (RTF=%.3f)\n", x_realtime, realtime_factor);

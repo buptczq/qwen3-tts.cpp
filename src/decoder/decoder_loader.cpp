@@ -24,6 +24,10 @@ const std::string & AudioTokenizerDecoder::get_error() const {
     return impl_->error_msg;
 }
 
+const audio_decoder_timing & AudioTokenizerDecoder::get_last_timing() const {
+    return impl_->last_timing;
+}
+
 void AudioTokenizerDecoder::unload_model() {
     auto & model = impl_->model;
     auto & state = impl_->state;

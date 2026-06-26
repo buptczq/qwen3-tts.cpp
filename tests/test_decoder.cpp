@@ -125,6 +125,15 @@ int main(int argc, char ** argv) {
     }
     printf("  PASS: Decoded %zu samples (%.3f seconds at %d Hz)\n",
            samples.size(), (float)samples.size() / config.sample_rate, config.sample_rate);
+    const qwen3_tts::audio_decoder_timing first_timing = decoder.get_last_timing();
+    printf("  Timing: build=%lld alloc=%lld upload=%lld compute=%lld read=%lld total=%lld rebuilt=%d\n",
+           (long long) first_timing.graph_build_ms,
+           (long long) first_timing.graph_alloc_ms,
+           (long long) first_timing.input_upload_ms,
+           (long long) first_timing.graph_compute_ms,
+           (long long) first_timing.output_read_ms,
+           (long long) first_timing.total_ms,
+           first_timing.graph_rebuilt);
     
     float min_val = samples[0], max_val = samples[0], sum = 0;
     for (float s : samples) {
@@ -134,9 +143,50 @@ int main(int argc, char ** argv) {
     }
     printf("  Audio stats: min=%.4f, max=%.4f, mean=%.6f\n", min_val, max_val, sum / samples.size());
     printf("\n");
+
+    printf("Test 4: Decode stability with cached graph\n");
+    std::vector<float> samples_second;
+    if (!decoder.decode(codes_i32.data(), n_frames, samples_second)) {
+        fprintf(stderr, "  FAIL: second decode failed: %s\n", decoder.get_error().c_str());
+        return 1;
+    }
+    if (samples_second.size() != samples.size()) {
+        fprintf(stderr, "  FAIL: second decode sample count changed: %zu vs %zu\n",
+                samples_second.size(), samples.size());
+        fail_count++;
+    } else {
+        const qwen3_tts::audio_decoder_timing second_timing = decoder.get_last_timing();
+        printf("  Second timing: build=%lld alloc=%lld upload=%lld compute=%lld read=%lld total=%lld rebuilt=%d\n",
+               (long long) second_timing.graph_build_ms,
+               (long long) second_timing.graph_alloc_ms,
+               (long long) second_timing.input_upload_ms,
+               (long long) second_timing.graph_compute_ms,
+               (long long) second_timing.output_read_ms,
+               (long long) second_timing.total_ms,
+               second_timing.graph_rebuilt);
+        double max_abs_diff = 0.0;
+        double rms_diff = 0.0;
+        for (size_t i = 0; i < samples.size(); ++i) {
+            const double diff = (double) samples_second[i] - (double) samples[i];
+            const double abs_diff = std::abs(diff);
+            if (abs_diff > max_abs_diff) {
+                max_abs_diff = abs_diff;
+            }
+            rms_diff += diff * diff;
+        }
+        rms_diff = samples.empty() ? 0.0 : std::sqrt(rms_diff / (double) samples.size());
+        printf("  Cached graph repeat max_abs_diff=%.9f rms=%.9f\n", max_abs_diff, rms_diff);
+        if (max_abs_diff > 1e-6 || rms_diff > 1e-7) {
+            printf("  FAIL: repeated decode is not stable\n");
+            fail_count++;
+        } else {
+            printf("  PASS: repeated decode is stable\n");
+        }
+    }
+    printf("\n");
     
     if (output_path) {
-        printf("Test 4: Save decoded audio to %s\n", output_path);
+        printf("Test 5: Save decoded audio to %s\n", output_path);
         if (save_binary_file(output_path, samples.data(), samples.size() * sizeof(float))) {
             printf("  PASS: Saved %zu samples\n", samples.size());
         } else {
@@ -146,7 +196,7 @@ int main(int argc, char ** argv) {
         printf("\n");
     }
     
-    printf("Test 5: Compare with reference audio from %s\n", reference_path);
+    printf("Test 6: Compare with reference audio from %s\n", reference_path);
     std::vector<uint8_t> ref_data;
     if (!load_binary_file(reference_path, ref_data)) {
         fprintf(stderr, "  SKIP: Could not load reference file\n");

@@ -101,6 +101,15 @@ static void print_result_timing(const qwen3_tts::tts_result & result) {
     fprintf(stderr, "  Encode:    %6lld ms\n", (long long) result.t_encode_ms);
     fprintf(stderr, "  Generate:  %6lld ms\n", (long long) result.t_generate_ms);
     fprintf(stderr, "  Decode:    %6lld ms\n", (long long) result.t_decode_ms);
+    fprintf(stderr, "    graph build:   %6lld ms %s\n",
+            (long long) result.t_decode_graph_build_ms,
+            result.decode_graph_rebuilt ? "(rebuilt)" : "(cached)");
+    fprintf(stderr, "    graph alloc:   %6lld ms\n", (long long) result.t_decode_graph_alloc_ms);
+    fprintf(stderr, "    input upload:  %6lld ms\n", (long long) result.t_decode_input_upload_ms);
+    fprintf(stderr, "    graph compute: %6lld ms\n", (long long) result.t_decode_graph_compute_ms);
+    fprintf(stderr, "    output read:   %6lld ms\n", (long long) result.t_decode_output_read_ms);
+    fprintf(stderr, "    frames/samples:%6d / %lld\n",
+            result.decode_frames, (long long) result.decode_samples);
     fprintf(stderr, "  Total:     %6lld ms\n", (long long) result.t_total_ms);
 }
 
