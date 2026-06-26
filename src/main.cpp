@@ -1,7 +1,12 @@
 #include "qwen3_tts.h"
 
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -45,6 +50,100 @@ static std::vector<std::string> get_utf8_argv() {
 }
 #endif
 
+static bool read_text_file(const std::string & path, std::string & text, std::string & error) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        error = "failed to open file: " + path;
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    text = ss.str();
+    return true;
+}
+
+static void normalize_text_newlines(std::string & text) {
+    std::string out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\r') {
+            if (i + 1 < text.size() && text[i + 1] == '\n') {
+                continue;
+            }
+            out.push_back('\n');
+        } else {
+            out.push_back(text[i]);
+        }
+    }
+    text.swap(out);
+}
+
+static bool load_speech_codes_file(const std::string & path,
+                                   qwen3_tts::speech_codes & codes,
+                                   std::string & error) {
+    std::string content;
+    if (!read_text_file(path, content, error)) {
+        return false;
+    }
+    for (char & ch : content) {
+        const unsigned char c = (unsigned char) ch;
+        if (!std::isdigit(c) && ch != '-') {
+            ch = ' ';
+        }
+    }
+
+    std::stringstream ss(content);
+    long long value = 0;
+    codes.codes.clear();
+    while (ss >> value) {
+        if (value < std::numeric_limits<int32_t>::min() ||
+            value > std::numeric_limits<int32_t>::max()) {
+            error = "speech code out of int32 range in: " + path;
+            return false;
+        }
+        codes.codes.push_back((int32_t) value);
+    }
+    if (codes.codes.empty()) {
+        error = "no integer speech codes found in: " + path;
+        return false;
+    }
+    codes.n_frames = 0;
+    codes.n_codebooks = 0;
+    return true;
+}
+
+static bool load_int32_list_file(const std::string & path,
+                                 std::vector<int32_t> & values,
+                                 std::string & error) {
+    std::string content;
+    if (!read_text_file(path, content, error)) {
+        return false;
+    }
+    for (char & ch : content) {
+        const unsigned char c = (unsigned char) ch;
+        if (!std::isdigit(c) && ch != '-') {
+            ch = ' ';
+        }
+    }
+
+    std::stringstream ss(content);
+    long long value = 0;
+    values.clear();
+    while (ss >> value) {
+        if (value < std::numeric_limits<int32_t>::min() ||
+            value > std::numeric_limits<int32_t>::max()) {
+            error = "integer out of int32 range in: " + path;
+            return false;
+        }
+        values.push_back((int32_t) value);
+    }
+    if (values.empty()) {
+        error = "no integer values found in: " + path;
+        return false;
+    }
+    return true;
+}
+
 void print_usage(const char * program) {
     fprintf(stderr, "Usage: %s [options] -m <model_dir> -t <text>\n", program);
     fprintf(stderr, "\n");
@@ -53,6 +152,12 @@ void print_usage(const char * program) {
     fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
+    fprintf(stderr, "  --reference-text <text> Reference transcript for ICL voice cloning\n");
+    fprintf(stderr, "  --reference-text-file <file> Read ICL reference transcript from file\n");
+    fprintf(stderr, "  --reference-token-ids <file> Reference prompt token IDs for ICL voice cloning\n");
+    fprintf(stderr, "  --reference-codes <file> Reference speech codes as integer text/JSON array\n");
+    fprintf(stderr, "  --dump-generated-codes <file> Save generated speech codes for debugging\n");
+    fprintf(stderr, "  --dump-decoder-codes <file> Save decoder-input speech codes for debugging\n");
     fprintf(stderr, "  --speaker <name>       Named speaker (CustomVoice models)\n");
     fprintf(stderr, "  --speaker-embedding <file> Use precomputed speaker embedding (.json/.bin)\n");
     fprintf(stderr, "  --dump-speaker-embedding <file> Save extracted embedding from --reference\n");
@@ -95,6 +200,9 @@ int main(int argc, char ** argv) {
     std::string text;
     std::string output_file = "output.wav";
     std::string reference_audio;
+    std::string reference_text_file;
+    std::string reference_token_ids_file;
+    std::string reference_codes_file;
     std::string speaker_embedding_file;
     std::string dump_speaker_embedding_file;
     
@@ -138,6 +246,42 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             reference_audio = args[i];
+        } else if (arg == "--reference-text") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing reference text\n");
+                return 1;
+            }
+            params.reference_text = args[i];
+        } else if (arg == "--reference-text-file") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing reference text file\n");
+                return 1;
+            }
+            reference_text_file = args[i];
+        } else if (arg == "--reference-token-ids") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing reference token IDs file\n");
+                return 1;
+            }
+            reference_token_ids_file = args[i];
+        } else if (arg == "--reference-codes") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing reference codes file\n");
+                return 1;
+            }
+            reference_codes_file = args[i];
+        } else if (arg == "--dump-generated-codes") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing generated codes output file\n");
+                return 1;
+            }
+            params.dump_generated_codes_path = args[i];
+        } else if (arg == "--dump-decoder-codes") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing decoder codes output file\n");
+                return 1;
+            }
+            params.dump_decoder_codes_path = args[i];
         } else if (arg == "--speaker") {
             if (++i >= (int) args.size()) {
                 fprintf(stderr, "Error: missing speaker name\n");
@@ -253,6 +397,45 @@ int main(int argc, char ** argv) {
     if (!dump_speaker_embedding_file.empty() && reference_audio.empty()) {
         fprintf(stderr, "Error: --dump-speaker-embedding requires --reference\n");
         return 1;
+    }
+    if (!reference_text_file.empty()) {
+        std::string error;
+        if (!read_text_file(reference_text_file, params.reference_text, error)) {
+            fprintf(stderr, "Error: %s\n", error.c_str());
+            return 1;
+        }
+        normalize_text_newlines(params.reference_text);
+    }
+    if (!reference_token_ids_file.empty()) {
+        std::string error;
+        if (!load_int32_list_file(reference_token_ids_file, params.reference_token_ids, error)) {
+            fprintf(stderr, "Error: %s\n", error.c_str());
+            return 1;
+        }
+    }
+    if (!reference_codes_file.empty()) {
+        qwen3_tts::speech_codes codes;
+        std::string error;
+        if (!load_speech_codes_file(reference_codes_file, codes, error)) {
+            fprintf(stderr, "Error: %s\n", error.c_str());
+            return 1;
+        }
+        params.reference_codes = std::move(codes);
+    }
+    if ((!params.reference_text.empty() || !params.reference_token_ids.empty()) &&
+        !params.reference_codes.has_value()) {
+        fprintf(stderr, "Error: reference text/token IDs require --reference-codes\n");
+        return 1;
+    }
+    if (params.reference_codes.has_value()) {
+        if (params.reference_text.empty() && params.reference_token_ids.empty()) {
+            fprintf(stderr, "Error: --reference-codes requires --reference-text, --reference-text-file, or --reference-token-ids\n");
+            return 1;
+        }
+        if (reference_audio.empty() && speaker_embedding_file.empty() && params.speaker.empty()) {
+            fprintf(stderr, "Error: --reference-codes requires --reference, --speaker-embedding, or --speaker\n");
+            return 1;
+        }
     }
     
     // Initialize TTS

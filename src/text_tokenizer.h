@@ -31,6 +31,10 @@ public:
     
     // Encode with TTS text format: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
     std::vector<int32_t> encode_for_tts(const std::string & text) const;
+
+    // Encode reference text for ICL voice cloning:
+    // <|im_start|>assistant\n{text}<|im_end|>\n
+    std::vector<int32_t> encode_reference_for_tts(const std::string & text) const;
     
     // Encode instruction for TTS (e.g. voice steering)
     std::vector<int32_t> encode_instruct(const std::string & instruct) const;

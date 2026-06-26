@@ -33,7 +33,12 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                               float temperature,
                               int32_t top_k,
                               const int32_t * instruct_tokens,
-                              int32_t n_instruct_tokens) {
+                              int32_t n_instruct_tokens,
+                              const int32_t * reference_tokens,
+                              int32_t n_reference_tokens,
+                              const int32_t * reference_codes,
+                              int32_t n_reference_frames,
+                              int32_t n_reference_codebooks) {
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
@@ -79,7 +84,10 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #endif
     if (!transformer_internal::ops::build_prefill_graph(*this, text_tokens, n_tokens, speaker_embd, language_id,
                              prefill_embd, trailing_text_hidden, tts_pad_embed,
-                             instruct_tokens, n_instruct_tokens)) {
+                             instruct_tokens, n_instruct_tokens,
+                             reference_tokens, n_reference_tokens,
+                             reference_codes, n_reference_frames,
+                             n_reference_codebooks)) {
         return false;
     }
 #ifdef QWEN3_TTS_TIMING

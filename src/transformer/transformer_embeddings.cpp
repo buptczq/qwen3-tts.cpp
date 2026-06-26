@@ -2,6 +2,7 @@
 #include "transformer/transformer_state_internal.h"
 #include "transformer/transformer_internal.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -222,7 +223,12 @@ bool transformer_internal::ops::build_prefill_graph(TTSTransformer & self,
                                                     std::vector<float> & trailing_text_hidden,
                                                     std::vector<float> & tts_pad_embed,
                                                     const int32_t * instruct_tokens,
-                                                    int32_t n_instruct_tokens) {
+                                                    int32_t n_instruct_tokens,
+                                                    const int32_t * reference_tokens,
+                                                    int32_t n_reference_tokens,
+                                                    const int32_t * reference_codes,
+                                                    int32_t n_reference_frames,
+                                                    int32_t n_reference_codebooks) {
     auto & impl = self.impl_;
     auto & error_msg = self.error_msg_;
 
@@ -235,8 +241,11 @@ bool transformer_internal::ops::build_prefill_graph(TTSTransformer & self,
         return false;
     }
 
-    fprintf(stderr, "  build_prefill_graph: n_tokens=%d, n_instruct=%d, has_speaker=%s\n",
-            n_tokens, n_instruct_tokens, speaker_embd ? "yes" : "no");
+    const bool has_reference = reference_tokens || reference_codes ||
+                               n_reference_tokens > 0 || n_reference_frames > 0;
+    fprintf(stderr, "  build_prefill_graph: n_tokens=%d, n_instruct=%d, has_speaker=%s, has_reference=%s\n",
+            n_tokens, n_instruct_tokens, speaker_embd ? "yes" : "no",
+            has_reference ? "yes" : "no");
 
     const auto & cfg = impl->model.config;
     const int32_t hidden_size = cfg.hidden_size;
@@ -301,6 +310,142 @@ bool transformer_internal::ops::build_prefill_graph(TTSTransformer & self,
                                "inp_codec_tail_tokens", "codec_tail_rows",
                                codec_tail_embed)) {
         return false;
+    }
+
+    if (has_reference) {
+        if (!speaker_embd) {
+            error_msg = "ICL reference prefill requires a speaker embedding";
+            return false;
+        }
+        if (!reference_tokens || n_reference_tokens < 5) {
+            error_msg = "ICL reference prefill requires reference text tokens";
+            return false;
+        }
+        if (!reference_codes || n_reference_frames <= 0) {
+            error_msg = "ICL reference prefill requires reference speech codes";
+            return false;
+        }
+        if (n_reference_codebooks != cfg.n_codebooks) {
+            error_msg = "ICL reference codebook count does not match model";
+            return false;
+        }
+        if (n_tokens < 8) {
+            error_msg = "Need at least 8 text tokens for ICL prefill";
+            return false;
+        }
+
+        auto append_row = [&](std::vector<float> & dst, const float * row) {
+            dst.insert(dst.end(), row, row + hidden_size);
+        };
+        auto append_rows = [&](std::vector<float> & dst, const std::vector<float> & rows) {
+            dst.insert(dst.end(), rows.begin(), rows.end());
+        };
+        auto append_added_row = [&](std::vector<float> & dst, const float * a, const float * b) {
+            const size_t base = dst.size();
+            dst.resize(base + (size_t) hidden_size);
+            float * out = dst.data() + base;
+            for (int32_t h = 0; h < hidden_size; ++h) {
+                out[h] = a[h] + b[h];
+            }
+        };
+
+        std::vector<float> prompt;
+        if (n_instruct_tokens > 0 && instruct_tokens) {
+            append_rows(prompt, instruct_embed);
+        }
+        append_rows(prompt, role_embed);
+
+        const int32_t codec_input_len = (int32_t) codec_prefill_tokens.size() + 1 + 2;
+        std::vector<float> codec_input_embedding((size_t) codec_input_len * hidden_size);
+        int32_t dst_token = 0;
+        memcpy(codec_input_embedding.data(), codec_prefill_embed.data(),
+               codec_prefill_embed.size() * sizeof(float));
+        dst_token += (int32_t) codec_prefill_tokens.size();
+        memcpy(codec_input_embedding.data() + (size_t) dst_token * hidden_size,
+               speaker_embd, hidden_size * sizeof(float));
+        ++dst_token;
+        memcpy(codec_input_embedding.data() + (size_t) dst_token * hidden_size,
+               codec_tail_embed.data(), codec_tail_embed.size() * sizeof(float));
+
+        const int32_t codec_plus_overlay_len = codec_input_len - 1;
+        for (int32_t row = 0; row < codec_plus_overlay_len; ++row) {
+            const float * overlay = (row == codec_plus_overlay_len - 1)
+                ? tts_bos_embed.data()
+                : tts_pad_embed.data();
+            append_added_row(prompt, overlay,
+                             codec_input_embedding.data() + (size_t) row * hidden_size);
+        }
+
+        const int32_t target_text_count = n_tokens - 3 - 5;
+        const int32_t reference_text_count = n_reference_tokens - 3 - 2;
+        if (target_text_count < 0 || reference_text_count < 0) {
+            error_msg = "ICL text token layout is invalid";
+            return false;
+        }
+
+        std::vector<int32_t> combined_text;
+        combined_text.reserve((size_t) reference_text_count + target_text_count);
+        combined_text.insert(combined_text.end(),
+                             reference_tokens + 3,
+                             reference_tokens + 3 + reference_text_count);
+        combined_text.insert(combined_text.end(),
+                             text_tokens + 3,
+                             text_tokens + 3 + target_text_count);
+
+        std::vector<float> text_embed;
+        if (!combined_text.empty()) {
+            if (!project_text_tokens(self, combined_text.data(), (int32_t) combined_text.size(), text_embed)) {
+                return false;
+            }
+        }
+        append_row(text_embed, tts_eos_embed.data());
+
+        std::vector<float> ref_codec;
+        ref_codec.reserve((size_t) (n_reference_frames + 1) * hidden_size);
+        append_row(ref_codec, codec_tail_embed.data() + (size_t) hidden_size);
+        std::vector<float> code_row(hidden_size);
+        std::vector<float> summed(hidden_size);
+        for (int32_t frame = 0; frame < n_reference_frames; ++frame) {
+            std::fill(summed.begin(), summed.end(), 0.0f);
+            for (int32_t cb = 0; cb < n_reference_codebooks; ++cb) {
+                const int32_t code = reference_codes[(size_t) frame * n_reference_codebooks + cb];
+                struct ggml_tensor * table = cb == 0
+                    ? impl->model.codec_embd
+                    : impl->model.code_pred_embd[(size_t) cb - 1];
+                if (!lookup_single_embedding_row(self, table, code, code_row.data())) {
+                    return false;
+                }
+                for (int32_t h = 0; h < hidden_size; ++h) {
+                    summed[h] += code_row[h];
+                }
+            }
+            append_row(ref_codec, summed.data());
+        }
+
+        const int32_t text_rows = (int32_t) (text_embed.size() / hidden_size);
+        const int32_t ref_codec_rows = (int32_t) (ref_codec.size() / hidden_size);
+        const int32_t overlap_rows = std::min(text_rows, ref_codec_rows);
+        for (int32_t row = 0; row < overlap_rows; ++row) {
+            append_added_row(prompt,
+                             text_embed.data() + (size_t) row * hidden_size,
+                             ref_codec.data() + (size_t) row * hidden_size);
+        }
+        for (int32_t row = overlap_rows; row < ref_codec_rows; ++row) {
+            append_added_row(prompt,
+                             tts_pad_embed.data(),
+                             ref_codec.data() + (size_t) row * hidden_size);
+        }
+
+        if (text_rows > ref_codec_rows) {
+            const size_t offset = (size_t) ref_codec_rows * hidden_size;
+            trailing_text_hidden.assign(text_embed.begin() + (std::ptrdiff_t) offset,
+                                        text_embed.end());
+        } else {
+            trailing_text_hidden = tts_pad_embed;
+        }
+
+        prefill_embd = std::move(prompt);
+        return true;
     }
 
     const bool has_speaker = (speaker_embd != nullptr);

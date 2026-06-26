@@ -39,7 +39,12 @@ struct ops {
                                     std::vector<float> & trailing_text_hidden,
                                     std::vector<float> & tts_pad_embed,
                                     const int32_t * instruct_tokens = nullptr,
-                                    int32_t n_instruct_tokens = 0);
+                                    int32_t n_instruct_tokens = 0,
+                                    const int32_t * reference_tokens = nullptr,
+                                    int32_t n_reference_tokens = 0,
+                                    const int32_t * reference_codes = nullptr,
+                                    int32_t n_reference_frames = 0,
+                                    int32_t n_reference_codebooks = 0);
 
     static struct ggml_cgraph * build_prefill_forward_graph(TTSTransformer & self, int32_t n_tokens, int32_t n_past);
     static struct ggml_cgraph * build_step_graph(TTSTransformer & self, int32_t n_past);

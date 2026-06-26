@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
 
 namespace qwen3_tts {
 using pipeline_internal::format_bytes;
@@ -12,6 +13,40 @@ using pipeline_internal::log_memory_usage;
 using pipeline_internal::ops;
 using pipeline_internal::process_memory_snapshot;
 using pipeline_internal::resample_linear;
+
+namespace {
+
+bool write_codes_file(const std::string & path,
+                      const std::vector<int32_t> & codes,
+                      int32_t n_frames,
+                      int32_t n_codebooks,
+                      std::string & error) {
+    std::ofstream out(path, std::ios::out | std::ios::trunc);
+    if (!out) {
+        error = "Failed to open speech-code dump: " + path;
+        return false;
+    }
+    out << "{\n  \"frames\": " << n_frames
+        << ",\n  \"codebooks\": " << n_codebooks
+        << ",\n  \"codes\": [";
+    for (size_t i = 0; i < codes.size(); ++i) {
+        if (i > 0) {
+            out << ',';
+        }
+        if (n_codebooks > 0 && i % (size_t) n_codebooks == 0) {
+            out << "\n    ";
+        }
+        out << codes[i];
+    }
+    out << "\n  ]\n}\n";
+    if (!out) {
+        error = "Failed to write speech-code dump: " + path;
+        return false;
+    }
+    return true;
+}
+
+} // namespace
 
 tts_result Qwen3TTS::synthesize(const std::string & text,
                                 const tts_params & params) {
@@ -247,6 +282,17 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
     if (!params.instruction.empty()) {
         instruct_tokens = self.tokenizer_.encode_instruct(params.instruction);
     }
+    std::vector<int32_t> reference_tokens;
+    if (params.reference_codes.has_value()) {
+        if (!params.reference_token_ids.empty()) {
+            reference_tokens = params.reference_token_ids;
+        } else if (params.reference_text.empty()) {
+            result.error_msg = "ICL reference codes require reference_text";
+            return result;
+        } else {
+            reference_tokens = self.tokenizer_.encode_reference_for_tts(params.reference_text);
+        }
+    }
     result.t_tokenize_ms = get_time_ms() - t_tokenize_start;
     sample_memory("synth/after-tokenize");
 
@@ -258,11 +304,18 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
         result.error_msg = "Failed to tokenize instruction";
         return result;
     }
+    if (params.reference_codes.has_value() && reference_tokens.empty()) {
+        result.error_msg = "Failed to tokenize reference text";
+        return result;
+    }
 
     if (params.print_progress) {
         fprintf(stderr, "Text tokenized: %zu tokens\n", text_tokens.size());
         if (!instruct_tokens.empty()) {
             fprintf(stderr, "Instruction tokenized: %zu tokens\n", instruct_tokens.size());
+        }
+        if (!reference_tokens.empty()) {
+            fprintf(stderr, "Reference text tokenized: %zu tokens\n", reference_tokens.size());
         }
         fprintf(stderr, "  Tokens: ");
         for (size_t i = 0; i < std::min(text_tokens.size(), (size_t) 10); ++i) {
@@ -288,13 +341,49 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
     }
     self.transformer_.clear_kv_cache();
 
-    std::vector<int32_t> speech_codes;
+    speech_codes reference_codes;
+    const speech_codes * reference_codes_ptr = nullptr;
+    if (params.reference_codes.has_value()) {
+        if (!speaker_embedding) {
+            result.error_msg = "ICL reference codes require a speaker embedding";
+            return result;
+        }
+        reference_codes = *params.reference_codes;
+        const int32_t model_codebooks = self.transformer_.get_config().n_codebooks;
+        if (reference_codes.n_codebooks == 0) {
+            reference_codes.n_codebooks = model_codebooks;
+        } else if (reference_codes.n_codebooks != model_codebooks) {
+            result.error_msg = "ICL reference codebook count does not match loaded model";
+            return result;
+        }
+        if (reference_codes.codes.empty() ||
+            reference_codes.codes.size() % (size_t) reference_codes.n_codebooks != 0) {
+            result.error_msg = "ICL reference code count is not divisible by codebook count";
+            return result;
+        }
+        const int32_t inferred_frames =
+            (int32_t) (reference_codes.codes.size() / (size_t) reference_codes.n_codebooks);
+        if (reference_codes.n_frames == 0) {
+            reference_codes.n_frames = inferred_frames;
+        } else if (reference_codes.n_frames != inferred_frames) {
+            result.error_msg = "ICL reference frame count does not match code count";
+            return result;
+        }
+        reference_codes_ptr = &reference_codes;
+    }
+
+    std::vector<int32_t> generated_codes;
     if (!self.transformer_.generate(text_tokens.data(), (int32_t) text_tokens.size(),
-                                    speaker_embedding, params.max_audio_tokens, speech_codes,
+                                    speaker_embedding, params.max_audio_tokens, generated_codes,
                                     params.language_id, params.repetition_penalty,
                                     params.temperature, params.top_k,
                                     instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
-                                    (int32_t) instruct_tokens.size())) {
+                                    (int32_t) instruct_tokens.size(),
+                                    reference_tokens.empty() ? nullptr : reference_tokens.data(),
+                                    (int32_t) reference_tokens.size(),
+                                    reference_codes_ptr ? reference_codes_ptr->codes.data() : nullptr,
+                                    reference_codes_ptr ? reference_codes_ptr->n_frames : 0,
+                                    reference_codes_ptr ? reference_codes_ptr->n_codebooks : 0)) {
         result.error_msg = "Failed to generate speech codes: " + self.transformer_.get_error();
         return result;
     }
@@ -302,7 +391,7 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
     sample_memory("synth/after-generate");
 
     int n_codebooks = self.transformer_.get_config().n_codebooks;
-    int n_frames = (int) speech_codes.size() / n_codebooks;
+    int n_frames = (int) generated_codes.size() / n_codebooks;
 
     if (params.print_progress) {
         fprintf(stderr, "Speech codes generated: %d frames x %d codebooks\n", n_frames, n_codebooks);
@@ -311,6 +400,12 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
     if (n_frames == 0) {
         result.error_msg = "No speech codes generated";
         return result;
+    }
+    if (!params.dump_generated_codes_path.empty()) {
+        if (!write_codes_file(params.dump_generated_codes_path, generated_codes,
+                              n_frames, n_codebooks, result.error_msg)) {
+            return result;
+        }
     }
 
     if (self.low_mem_mode_) {
@@ -338,9 +433,40 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
         }
     }
 
-    if (!self.audio_decoder_.decode(speech_codes.data(), n_frames, result.audio)) {
+    std::vector<int32_t> decoder_codes;
+    const int32_t decoder_frames = reference_codes_ptr ? n_frames + reference_codes_ptr->n_frames : n_frames;
+    const int32_t * decoder_code_data = generated_codes.data();
+    if (reference_codes_ptr) {
+        decoder_codes.reserve(reference_codes_ptr->codes.size() + generated_codes.size());
+        decoder_codes.insert(decoder_codes.end(),
+                             reference_codes_ptr->codes.begin(),
+                             reference_codes_ptr->codes.end());
+        decoder_codes.insert(decoder_codes.end(), generated_codes.begin(), generated_codes.end());
+        decoder_code_data = decoder_codes.data();
+    }
+    if (!params.dump_decoder_codes_path.empty()) {
+        const auto & dump_codes = reference_codes_ptr ? decoder_codes : generated_codes;
+        if (!write_codes_file(params.dump_decoder_codes_path, dump_codes,
+                              decoder_frames, n_codebooks, result.error_msg)) {
+            return result;
+        }
+    }
+
+    if (!self.audio_decoder_.decode(decoder_code_data, decoder_frames, result.audio)) {
         result.error_msg = "Failed to decode speech codes: " + self.audio_decoder_.get_error();
         return result;
+    }
+    if (reference_codes_ptr) {
+        const int64_t cut = decoder_frames > 0
+            ? (int64_t) ((double) reference_codes_ptr->n_frames /
+                         (double) decoder_frames *
+                         (double) result.audio.size())
+            : 0;
+        if (cut < 0 || cut > (int64_t) result.audio.size()) {
+            result.error_msg = "ICL reference trim is out of range";
+            return result;
+        }
+        result.audio.erase(result.audio.begin(), result.audio.begin() + cut);
     }
     result.t_decode_ms = get_time_ms() - t_decode_start;
     sample_memory("synth/after-decode");

@@ -155,7 +155,12 @@ public:
                   float temperature = 0.9f,
                   int32_t top_k = 50,
                   const int32_t * instruct_tokens = nullptr,
-                  int32_t n_instruct_tokens = 0);
+                  int32_t n_instruct_tokens = 0,
+                  const int32_t * reference_tokens = nullptr,
+                  int32_t n_reference_tokens = 0,
+                  const int32_t * reference_codes = nullptr,
+                  int32_t n_reference_frames = 0,
+                  int32_t n_reference_codebooks = 0);
     
     const tts_transformer_config & get_config() const;
     

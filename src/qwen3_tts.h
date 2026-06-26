@@ -9,11 +9,18 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <optional>
 
 namespace qwen3_tts {
 namespace pipeline_internal {
 struct ops;
 }
+
+struct speech_codes {
+    std::vector<int32_t> codes;
+    int32_t n_frames = 0;
+    int32_t n_codebooks = 0;
+};
 
 // TTS generation parameters
 struct tts_params {
@@ -49,6 +56,16 @@ struct tts_params {
 
     // Optional named speaker (for CustomVoice models)
     std::string speaker;
+
+    // Optional ICL voice-clone prompt. reference_codes may omit n_codebooks; the
+    // loaded talker codebook count is used when inferring frames.
+    std::string reference_text;
+    std::vector<int32_t> reference_token_ids;
+    std::optional<speech_codes> reference_codes;
+
+    // Optional debug dumps for generated and decoder-input speech codes.
+    std::string dump_generated_codes_path;
+    std::string dump_decoder_codes_path;
 };
 
 // TTS generation result
