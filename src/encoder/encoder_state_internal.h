@@ -57,6 +57,7 @@ struct speaker_encoder_state {
     std::vector<uint8_t> compute_meta;
     std::vector<float> mel_filterbank;
     std::vector<float> stft_window;
+    std::vector<int32_t> fft_bit_reverse;
 };
 
 struct speaker_encoder_private {

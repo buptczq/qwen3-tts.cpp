@@ -87,6 +87,70 @@ void compute_dft(const float * input, float * real, float * imag, int n) {
     }
 }
 
+bool is_power_of_two(int n) {
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+void compute_bit_reverse(std::vector<int32_t> & bit_reverse, int n) {
+    bit_reverse.resize((size_t) n);
+    int bits = 0;
+    while ((1 << bits) < n) {
+        bits++;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        int x = i;
+        int y = 0;
+        for (int b = 0; b < bits; ++b) {
+            y = (y << 1) | (x & 1);
+            x >>= 1;
+        }
+        bit_reverse[(size_t) i] = y;
+    }
+}
+
+void compute_fft_radix2(const float * input,
+                        const std::vector<int32_t> & bit_reverse,
+                        float * real,
+                        float * imag,
+                        int n) {
+    for (int i = 0; i < n; ++i) {
+        const int j = bit_reverse[(size_t) i];
+        real[(size_t) j] = input[(size_t) i];
+        imag[(size_t) j] = 0.0f;
+    }
+
+    for (int len = 2; len <= n; len <<= 1) {
+        const float angle = -2.0f * k_pi / (float) len;
+        const float wlen_r = cosf(angle);
+        const float wlen_i = sinf(angle);
+        const int half = len >> 1;
+
+        for (int i = 0; i < n; i += len) {
+            float wr = 1.0f;
+            float wi = 0.0f;
+
+            for (int j = 0; j < half; ++j) {
+                const int even = i + j;
+                const int odd = even + half;
+                const float ur = real[(size_t) even];
+                const float ui = imag[(size_t) even];
+                const float vr = real[(size_t) odd] * wr - imag[(size_t) odd] * wi;
+                const float vi = real[(size_t) odd] * wi + imag[(size_t) odd] * wr;
+
+                real[(size_t) even] = ur + vr;
+                imag[(size_t) even] = ui + vi;
+                real[(size_t) odd] = ur - vr;
+                imag[(size_t) odd] = ui - vi;
+
+                const float next_wr = wr * wlen_r - wi * wlen_i;
+                wi = wr * wlen_i + wi * wlen_r;
+                wr = next_wr;
+            }
+        }
+    }
+}
+
 void compute_centered_window(float * window, int n_fft, int win_length) {
     memset(window, 0, (size_t) n_fft * sizeof(float));
 
@@ -111,6 +175,12 @@ void encoder_internal::ops::init_frontend_cache(AudioTokenizerEncoder & self) {
 
     state.stft_window.resize(model.config.n_fft);
     compute_centered_window(state.stft_window.data(), model.config.n_fft, model.config.win_length);
+
+    if (is_power_of_two(model.config.n_fft)) {
+        compute_bit_reverse(state.fft_bit_reverse, model.config.n_fft);
+    } else {
+        state.fft_bit_reverse.clear();
+    }
 }
 
 bool encoder_internal::ops::compute_mel_spectrogram(AudioTokenizerEncoder & self,
@@ -164,7 +234,11 @@ bool encoder_internal::ops::compute_mel_spectrogram(AudioTokenizerEncoder & self
             frame[i] = padded[start + i] * state.stft_window[i];
         }
 
-        compute_dft(frame.data(), fft_real.data(), fft_imag.data(), cfg.n_fft);
+        if (!state.fft_bit_reverse.empty()) {
+            compute_fft_radix2(frame.data(), state.fft_bit_reverse, fft_real.data(), fft_imag.data(), cfg.n_fft);
+        } else {
+            compute_dft(frame.data(), fft_real.data(), fft_imag.data(), cfg.n_fft);
+        }
 
         for (int k = 0; k < n_fft_bins; ++k) {
             magnitude[k] = sqrtf(fft_real[k] * fft_real[k] + fft_imag[k] * fft_imag[k] + 1e-9f);

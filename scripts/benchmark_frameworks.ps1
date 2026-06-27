@@ -129,8 +129,72 @@ function Quote-CommandArgument([string]$Arg) {
     return '"' + ($Arg -replace '"', '\"') + '"'
 }
 
-function Format-CommandLine([string]$Exe, [string[]]$Args) {
-    return (Quote-CommandArgument $Exe) + " " + (($Args | ForEach-Object { Quote-CommandArgument $_ }) -join " ")
+function Format-CommandLine([string]$Exe, [string[]]$CommandArgs) {
+    return (Quote-CommandArgument $Exe) + " " + (($CommandArgs | ForEach-Object { Quote-CommandArgument $_ }) -join " ")
+}
+
+function Convert-ToInvariantDouble([string]$Value) {
+    return [double]::Parse($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-RegexMetric([string]$Text, [string]$Pattern) {
+    $m = [regex]::Match($Text, $Pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
+    if ($m.Success) {
+        return Convert-ToInvariantDouble $m.Groups[1].Value
+    }
+    return $null
+}
+
+function Get-LastRegexMetric([string]$Text, [string]$Pattern) {
+    $matches = [regex]::Matches($Text, $Pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
+    if ($matches.Count -gt 0) {
+        return Convert-ToInvariantDouble $matches[$matches.Count - 1].Groups[1].Value
+    }
+    return $null
+}
+
+function Get-BenchmarkInternalMetrics([string]$Implementation, [string]$LogText) {
+    $metrics = [ordered]@{
+        InternalTotalMs = $null
+        InternalEncodeMs = $null
+        InternalGenerateMs = $null
+        InternalDecodeMs = $null
+        InternalLoadMs = $null
+        InternalTtfaMs = $null
+    }
+
+    if ($Implementation -eq "qwen_cpp") {
+        $metrics.InternalLoadMs = Get-RegexMetric $LogText "All models loaded in\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        $metrics.InternalEncodeMs = Get-RegexMetric $LogText "^\s*Encode:\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        $metrics.InternalGenerateMs = Get-RegexMetric $LogText "^\s*Generate:\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        $metrics.InternalDecodeMs = Get-RegexMetric $LogText "^\s*Decode:\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        $metrics.InternalTotalMs = Get-LastRegexMetric $LogText "^\s*Total:\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+    } elseif ($Implementation -eq "serveurperso") {
+        $metrics.InternalTotalMs = Get-RegexMetric $LogText "\[Perf\]\s+Total\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        $metrics.InternalEncodeMs = Get-RegexMetric $LogText "\[Perf\]\s+PromptBuild\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        $metrics.InternalGenerateMs = Get-RegexMetric $LogText "\[Perf\]\s+TalkerDecode\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        $metrics.InternalDecodeMs = Get-RegexMetric $LogText "\[Perf\]\s+CodecDecode\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        $metrics.InternalTtfaMs = Get-RegexMetric $LogText "\[Perf\]\s+TTFA\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+    } elseif ($Implementation -eq "audio_cpp") {
+        $metrics.InternalTotalMs = Get-RegexMetric $LogText "session\.wall_ms\s+([0-9]+(?:\.[0-9]+)?)"
+        $metrics.InternalEncodeMs = Get-RegexMetric $LogText "qwen3_tts\.voice_prompt_ms\s+([0-9]+(?:\.[0-9]+)?)"
+        $metrics.InternalGenerateMs = Get-RegexMetric $LogText "qwen3_tts\.talker_ms\s+([0-9]+(?:\.[0-9]+)?)"
+        $metrics.InternalDecodeMs = Get-RegexMetric $LogText "qwen3_tts\.speech_decoder_ms\s+([0-9]+(?:\.[0-9]+)?)"
+    } elseif ($Implementation -like "*_python") {
+        $m = [regex]::Match($LogText, "BENCHMARK_JSON\s+(\{.+\})")
+        if ($m.Success) {
+            try {
+                $json = $m.Groups[1].Value | ConvertFrom-Json
+                $metrics.InternalLoadMs = [double]$json.load_seconds * 1000.0
+                $metrics.InternalTotalMs = [double]$json.wall_seconds * 1000.0
+                $metrics.InternalGenerateMs = [double]$json.synth_seconds * 1000.0
+            } catch {
+                # Leave metrics empty when the worker failed before JSON output.
+            }
+        }
+    }
+
+    return [PSCustomObject]$metrics
 }
 
 function Invoke-GitText([string]$Repo, [string[]]$GitArgs) {
@@ -199,21 +263,54 @@ function New-PreflightRow([string]$Name, [string]$Repo, [string]$Executable, [st
     }
 }
 
-function Invoke-BenchmarkCommand([string]$Name, [string]$Exe, [string[]]$Args, [string]$WorkingDirectory, [string]$LogPath, [string]$StdinText) {
-    $commandLine = Format-CommandLine $Exe $Args
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    Push-Location -LiteralPath $WorkingDirectory
-    try {
-        if ([string]::IsNullOrEmpty($StdinText)) {
-            $output = & $Exe @Args 2>&1
-        } else {
-            $output = $StdinText | & $Exe @Args 2>&1
-        }
-        $exitCode = $LASTEXITCODE
-    } finally {
-        Pop-Location
+function Invoke-BenchmarkCommand([string]$Name, [string]$Exe, [string[]]$CommandArgs, [string]$WorkingDirectory, [string]$LogPath, [string]$StdinText) {
+    $commandLine = Format-CommandLine $Exe $CommandArgs
+    $argumentLine = ($CommandArgs | ForEach-Object { Quote-CommandArgument $_ }) -join " "
+    $stdoutPath = Join-Path $env:TEMP ("qwen3tts_bench_stdout_{0}.log" -f ([guid]::NewGuid().ToString("N")))
+    $stderrPath = Join-Path $env:TEMP ("qwen3tts_bench_stderr_{0}.log" -f ([guid]::NewGuid().ToString("N")))
+    $stdinPath = ""
+    if (-not [string]::IsNullOrEmpty($StdinText)) {
+        $stdinPath = Join-Path $env:TEMP ("qwen3tts_bench_stdin_{0}.txt" -f ([guid]::NewGuid().ToString("N")))
+        Set-Content -LiteralPath $stdinPath -Value $StdinText -NoNewline -Encoding UTF8
     }
-    $sw.Stop()
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $startArgs = @{
+            FilePath = $Exe
+            ArgumentList = $argumentLine
+            WorkingDirectory = $WorkingDirectory
+            RedirectStandardOutput = $stdoutPath
+            RedirectStandardError = $stderrPath
+            PassThru = $true
+            Wait = $true
+            WindowStyle = "Hidden"
+        }
+        if ($stdinPath) {
+            $startArgs.RedirectStandardInput = $stdinPath
+        }
+        $proc = Start-Process @startArgs
+        $exitCode = $proc.ExitCode
+    } finally {
+        $sw.Stop()
+    }
+
+    $stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { "" }
+    $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { "" }
+    $output = @()
+    if (-not [string]::IsNullOrWhiteSpace($stdout)) {
+        $output += "[stdout]"
+        $output += $stdout.TrimEnd()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+        $output += "[stderr]"
+        $output += $stderr.TrimEnd()
+    }
+    $outputText = $output -join [Environment]::NewLine
+
+    if (Test-Path -LiteralPath $stdoutPath) { Remove-Item -LiteralPath $stdoutPath -Force }
+    if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force }
+    if ($stdinPath -and (Test-Path -LiteralPath $stdinPath)) { Remove-Item -LiteralPath $stdinPath -Force }
 
     $logDir = Split-Path -Parent $LogPath
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -224,14 +321,14 @@ function Invoke-BenchmarkCommand([string]$Name, [string]$Exe, [string[]]$Args, [
         "WallSeconds: $($sw.Elapsed.TotalSeconds)",
         "",
         "[output]",
-        ($output | Out-String)
+        $outputText
     ) | Set-Content -LiteralPath $LogPath -Encoding UTF8
 
     return [PSCustomObject]@{
         Name = $Name
         ExitCode = $exitCode
         WallSeconds = $sw.Elapsed.TotalSeconds
-        LogText = ($output | Out-String)
+        LogText = $outputText
         CommandLine = $commandLine
     }
 }
@@ -242,6 +339,7 @@ function New-ResultRow([string]$Implementation, [int]$Run, [string]$OutWav, [obj
     $audioSeconds = if ($stats.Valid) { $stats.DurationSec } else { 0.0 }
     $rtf = if ($CommandResult.WallSeconds -gt 0) { $audioSeconds / $CommandResult.WallSeconds } else { 0.0 }
     $git = Get-GitSummary $RepoPath
+    $internal = Get-BenchmarkInternalMetrics -Implementation $Implementation -LogText $CommandResult.LogText
     [PSCustomObject]@{
         Implementation = $Implementation
         Variant = $Variant
@@ -252,6 +350,12 @@ function New-ResultRow([string]$Implementation, [int]$Run, [string]$OutWav, [obj
         AudioSeconds = [math]::Round($audioSeconds, 3)
         WallSeconds = [math]::Round($CommandResult.WallSeconds, 3)
         RTF_AudioPerWall = [math]::Round($rtf, 3)
+        InternalTotalMs = if ($null -ne $internal.InternalTotalMs) { [math]::Round($internal.InternalTotalMs, 1) } else { $null }
+        InternalLoadMs = if ($null -ne $internal.InternalLoadMs) { [math]::Round($internal.InternalLoadMs, 1) } else { $null }
+        InternalEncodeMs = if ($null -ne $internal.InternalEncodeMs) { [math]::Round($internal.InternalEncodeMs, 1) } else { $null }
+        InternalGenerateMs = if ($null -ne $internal.InternalGenerateMs) { [math]::Round($internal.InternalGenerateMs, 1) } else { $null }
+        InternalDecodeMs = if ($null -ne $internal.InternalDecodeMs) { [math]::Round($internal.InternalDecodeMs, 1) } else { $null }
+        InternalTtfaMs = if ($null -ne $internal.InternalTtfaMs) { [math]::Round($internal.InternalTtfaMs, 1) } else { $null }
         Peak = if ($stats.Valid) { [math]::Round($stats.Peak, 8) } else { $null }
         Rms = if ($stats.Valid) { [math]::Round($stats.Rms, 8) } else { $null }
         NonZeroSamples = if ($stats.Valid) { $stats.NonZeroSamples } else { $null }
@@ -395,6 +499,11 @@ if ($Scenario -eq "voice_clone") {
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 $logDir = Join-Path $OutDir "logs"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$serveurReferenceTextPath = ""
+if ($Scenario -eq "voice_clone" -and -not [string]::IsNullOrWhiteSpace($ReferenceText)) {
+    $serveurReferenceTextPath = Join-Path $OutDir "reference_text.txt"
+    Set-Content -LiteralPath $serveurReferenceTextPath -Value $ReferenceText -Encoding UTF8
+}
 
 $rows = New-Object System.Collections.Generic.List[object]
 $temperatureArg = if ($Greedy) { 0.0 } else { $Temperature }
@@ -434,6 +543,9 @@ for ($run = 1; $run -le $Runs; $run++) {
             }
             if ($Scenario -eq "voice_clone") {
                 $args += @("--ref-wav", $ReferenceAudio)
+                if ($serveurReferenceTextPath) {
+                    $args += @("--ref-text", $serveurReferenceTextPath)
+                }
             }
             Write-Host "[$run/$Runs] serveurperso" -ForegroundColor Yellow
             $cmd = Invoke-BenchmarkCommand "serveurperso" $exe $args $serveurRepo $logPath $Text
