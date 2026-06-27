@@ -455,6 +455,8 @@ python .\scripts\debug_trace_report.py --trace-a .\trace_cpp
 
 ## License
 
-Please review the upstream project terms, bundled dependency licenses, and the
-Qwen3-TTS model licenses before redistributing code, models, or generated
-artifacts.
+This project's source code is released under the MIT License. See
+[`LICENSE`](LICENSE).
+
+Please review bundled dependency licenses and the Qwen3-TTS model licenses
+before redistributing dependencies, model files, or generated artifacts.
