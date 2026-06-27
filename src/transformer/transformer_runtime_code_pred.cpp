@@ -385,6 +385,17 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             int32_t positions[8] = {0, 1, 0, 1, 0, 1, 0, 0};
             ggml_backend_tensor_set(inp_mrope_pos, positions, 0, 8 * sizeof(int32_t));
         }
+
+        struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
+        if (inp_mask) {
+            ggml_fp16_t mask[4];
+            std::fill(mask, mask + 4, ggml_fp32_to_fp16(-INFINITY));
+            const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+            mask[0] = zero;
+            mask[2] = zero;
+            mask[3] = zero;
+            ggml_backend_tensor_set(inp_mask, mask, 0, sizeof(mask));
+        }
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (impl_->timing) impl_->timing->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -502,8 +513,9 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 
         struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
         if (inp_mask) {
+            const size_t mask_size = (size_t) n_past + 1;
             ggml_backend_tensor_set(inp_mask, impl_->state.code_pred_mask.data(), 0,
-                                    impl_->state.code_pred_cache.n_ctx * sizeof(ggml_fp16_t));
+                                    mask_size * sizeof(ggml_fp16_t));
         }
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();

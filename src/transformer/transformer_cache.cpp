@@ -106,12 +106,12 @@ bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
     for (int il = 0; il < cfg.code_pred_layers; ++il) {
         impl_->state.code_pred_cache.k_cache[il] = ggml_new_tensor_3d(
             impl_->state.code_pred_cache.ctx, GGML_TYPE_F16,
-            cfg.code_pred_head_dim, cfg.code_pred_n_key_value_heads, n_ctx);
+            cfg.code_pred_head_dim, n_ctx, cfg.code_pred_n_key_value_heads);
         ggml_format_name(impl_->state.code_pred_cache.k_cache[il], "code_pred_k_cache_%d", il);
 
         impl_->state.code_pred_cache.v_cache[il] = ggml_new_tensor_3d(
             impl_->state.code_pred_cache.ctx, GGML_TYPE_F16,
-            cfg.code_pred_head_dim, cfg.code_pred_n_key_value_heads, n_ctx);
+            cfg.code_pred_head_dim, n_ctx, cfg.code_pred_n_key_value_heads);
         ggml_format_name(impl_->state.code_pred_cache.v_cache[il], "code_pred_v_cache_%d", il);
     }
 

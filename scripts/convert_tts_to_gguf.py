@@ -56,8 +56,8 @@ class Qwen3TTSConverter:
         # Code Predictor - Output norm
         "talker.code_predictor.model.norm.weight": "code_pred.output_norm.weight",
         # Code Predictor - talker hidden -> predictor hidden projection (1.7B)
-        "talker.code_predictor.small_to_mtp_projection.weight": "code_pred.small_to_mtp.weight",
-        "talker.code_predictor.small_to_mtp_projection.bias": "code_pred.small_to_mtp.bias",
+        "talker.code_predictor.small_to_mtp_projection.weight": "code_pred.mtp_proj.weight",
+        "talker.code_predictor.small_to_mtp_projection.bias": "code_pred.mtp_proj.bias",
         # Speaker Encoder - Initial conv
         "speaker_encoder.blocks.0.conv.weight": "spk_enc.conv0.weight",
         "speaker_encoder.blocks.0.conv.bias": "spk_enc.conv0.bias",
@@ -503,7 +503,20 @@ class Qwen3TTSConverter:
         # M-RoPE configuration
         writer.add_array(f"{arch}.rope.mrope_section", self.mrope_section)
 
-        # Code Predictor parameters
+        # Code Predictor parameters. Prefer the compact code_pred namespace used by Serveurperso's GGUFs.
+        writer.add_uint32(f"{arch}.code_pred.block_count", self.code_predictor_num_layers)
+        writer.add_uint32(f"{arch}.code_pred.vocab_size", self.code_predictor_vocab_size)
+        writer.add_uint32(f"{arch}.code_pred.embedding_length", self.code_predictor_hidden_size)
+        writer.add_uint32(f"{arch}.code_pred.feed_forward_length", self.code_predictor_intermediate_size)
+        writer.add_uint32(f"{arch}.code_pred.attention.head_count", self.code_predictor_num_attention_heads)
+        writer.add_uint32(f"{arch}.code_pred.attention.head_count_kv", self.code_predictor_num_kv_heads)
+        writer.add_uint32(f"{arch}.code_pred.attention.key_length", self.code_predictor_head_dim)
+        writer.add_float32(
+            f"{arch}.code_pred.attention.layer_norm_rms_epsilon", self.code_predictor_rms_norm_eps
+        )
+        writer.add_float32(f"{arch}.code_pred.rope.freq_base", self.code_predictor_rope_theta)
+
+        # Backward-compatible aliases for older qwen3-tts.cpp loaders and already generated local models.
         writer.add_uint32(f"{arch}.code_predictor.layer_count", self.code_predictor_num_layers)
         writer.add_uint32(f"{arch}.code_predictor.vocab_size", self.code_predictor_vocab_size)
         writer.add_uint32(f"{arch}.code_predictor.embedding_length", self.code_predictor_hidden_size)

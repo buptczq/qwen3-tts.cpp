@@ -123,11 +123,11 @@ bool transformer_internal::ops::create_tensors(TTSTransformer & self, struct ggu
             } else {
                 continue;
             }
-        } else if (strstr(name, "code_pred.small_to_mtp.weight")) {
+        } else if (strstr(name, "code_pred.small_to_mtp.weight") || strstr(name, "code_pred.mtp_proj.weight")) {
             ne[0] = cfg.hidden_size;
             ne[1] = cfg.code_pred_hidden_size;
             n_dims = 2;
-        } else if (strstr(name, "code_pred.small_to_mtp.bias")) {
+        } else if (strstr(name, "code_pred.small_to_mtp.bias") || strstr(name, "code_pred.mtp_proj.bias")) {
             ne[0] = cfg.code_pred_hidden_size;
             n_dims = 1;
         } else if (strstr(name, "code_pred.blk.")) {
@@ -257,9 +257,9 @@ bool transformer_internal::ops::create_tensors(TTSTransformer & self, struct ggu
                 else if (strstr(name, "ffn_up.weight")) layer.ffn_up = tensor;
                 else if (strstr(name, "ffn_down.weight")) layer.ffn_down = tensor;
             }
-        } else if (strstr(name, "code_pred.small_to_mtp.weight")) {
+        } else if (strstr(name, "code_pred.small_to_mtp.weight") || strstr(name, "code_pred.mtp_proj.weight")) {
             impl->model.code_pred_small_to_mtp_weight = tensor;
-        } else if (strstr(name, "code_pred.small_to_mtp.bias")) {
+        } else if (strstr(name, "code_pred.small_to_mtp.bias") || strstr(name, "code_pred.mtp_proj.bias")) {
             impl->model.code_pred_small_to_mtp_bias = tensor;
         } else if (strstr(name, "code_pred.blk.")) {
             int layer_idx = -1;

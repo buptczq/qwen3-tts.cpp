@@ -88,6 +88,7 @@ static bool is_quantizable_name(const std::string & name, int n_dims) {
            name.find("code_pred.blk.") != std::string::npos ||
            name.find("talker.text_proj.") != std::string::npos ||
            name.find("code_pred.small_to_mtp.") != std::string::npos ||
+           name.find("code_pred.mtp_proj.") != std::string::npos ||
            name.find("talker.codec_head.weight") != std::string::npos ||
            name.find("code_pred.lm_head.") != std::string::npos;
 }
