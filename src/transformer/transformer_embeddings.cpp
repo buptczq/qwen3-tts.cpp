@@ -478,18 +478,24 @@ bool transformer_internal::ops::build_prefill_graph(TTSTransformer & self,
         }
     }
 
-    std::vector<float> first_text_embed;
-    if (!project_text_tokens(self, text_tokens + 3, 1, first_text_embed)) {
+    const int32_t suffix_len = 5;
+    const int32_t text_body_count = n_tokens - 3 - suffix_len;
+    if (text_body_count < 0) {
+        error_msg = "Text token layout is invalid";
         return false;
     }
 
-    std::vector<float> first_text_plus_codec_bos(hidden_size);
-    const float * codec_bos_embed = codec_input_embedding.data() + (size_t) (codec_input_len - 1) * hidden_size;
-    for (int32_t h = 0; h < hidden_size; ++h) {
-        first_text_plus_codec_bos[h] = first_text_embed[h] + codec_bos_embed[h];
+    std::vector<float> text_body_proj;
+    if (text_body_count > 0) {
+        if (!project_text_tokens(self, text_tokens + 3, text_body_count, text_body_proj)) {
+            return false;
+        }
     }
 
-    const int32_t prefill_len = n_instruct_tokens + 3 + codec_plus_overlay_len + 1;
+    const float * codec_pad_embed = codec_tail_embed.data();
+    const float * codec_bos_embed = codec_tail_embed.data() + (size_t) hidden_size;
+
+    const int32_t prefill_len = n_instruct_tokens + 3 + codec_plus_overlay_len + text_body_count + 2;
     prefill_embd.resize((size_t) prefill_len * hidden_size);
 
     int32_t offset = 0;
@@ -505,25 +511,34 @@ bool transformer_internal::ops::build_prefill_graph(TTSTransformer & self,
     memcpy(prefill_embd.data() + (size_t) offset * hidden_size,
            codec_plus_overlay.data(), codec_plus_overlay.size() * sizeof(float));
     offset += codec_plus_overlay_len;
-    memcpy(prefill_embd.data() + (size_t) offset * hidden_size,
-           first_text_plus_codec_bos.data(), hidden_size * sizeof(float));
 
-    const int32_t suffix_len = 5;
-    const int32_t text_only_trailing_count = std::max(0, n_tokens - 4 - suffix_len);
-    std::vector<float> trailing_text_proj;
-    if (text_only_trailing_count > 0) {
-        if (!project_text_tokens(self, text_tokens + 4, text_only_trailing_count, trailing_text_proj)) {
-            return false;
+    for (int32_t t = 0; t < text_body_count; ++t) {
+        float * dst = prefill_embd.data() + (size_t) offset * hidden_size;
+        const float * text_row = text_body_proj.data() + (size_t) t * hidden_size;
+        for (int32_t h = 0; h < hidden_size; ++h) {
+            dst[h] = text_row[h] + codec_pad_embed[h];
         }
+        ++offset;
     }
 
-    const int32_t trailing_len = text_only_trailing_count + 1;
-    trailing_text_hidden.resize((size_t) trailing_len * hidden_size);
-    if (text_only_trailing_count > 0) {
-        memcpy(trailing_text_hidden.data(), trailing_text_proj.data(), trailing_text_proj.size() * sizeof(float));
+    float * eos_row = prefill_embd.data() + (size_t) offset * hidden_size;
+    for (int32_t h = 0; h < hidden_size; ++h) {
+        eos_row[h] = tts_eos_embed[h] + codec_pad_embed[h];
     }
-    memcpy(trailing_text_hidden.data() + (size_t) (trailing_len - 1) * hidden_size,
-           tts_eos_embed.data(), hidden_size * sizeof(float));
+    ++offset;
+
+    float * bos_row = prefill_embd.data() + (size_t) offset * hidden_size;
+    for (int32_t h = 0; h < hidden_size; ++h) {
+        bos_row[h] = tts_pad_embed[h] + codec_bos_embed[h];
+    }
+    ++offset;
+
+    if (offset != prefill_len) {
+        error_msg = "Internal error: prefill layout length mismatch";
+        return false;
+    }
+
+    trailing_text_hidden = tts_pad_embed;
 
     return true;
 }

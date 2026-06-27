@@ -86,15 +86,59 @@ def _load_faster(args: argparse.Namespace):
         sys.path.insert(0, str(Path(args.repo).resolve()))
     from faster_qwen3_tts import FasterQwen3TTS
 
-    return FasterQwen3TTS.from_pretrained(args.model)
+    dtype = _torch_dtype(args.dtype)
+    kwargs = {}
+    if args.device_map:
+        kwargs["device"] = "cuda" if args.device_map.startswith("cuda") else args.device_map
+    if dtype is not None:
+        kwargs["dtype"] = dtype
+    return FasterQwen3TTS.from_pretrained(args.model, **kwargs)
+
+
+def _move_prompt(prompt, device: str | None = None):
+    if isinstance(prompt, dict):
+        return {key: _move_prompt(value, device) for key, value in prompt.items()}
+    if isinstance(prompt, list):
+        return [_move_prompt(value, device) for value in prompt]
+    if hasattr(prompt, "detach"):
+        tensor = prompt.detach()
+        if device:
+            tensor = tensor.to(device)
+        else:
+            tensor = tensor.cpu()
+        return tensor
+    return prompt
+
+
+def _create_voice_prompt(model, args: argparse.Namespace):
+    if args.backend == "faster":
+        base = model.model
+        prompt_items = base.create_voice_clone_prompt(
+            ref_audio=args.reference_audio,
+            ref_text="",
+            x_vector_only_mode=True,
+        )
+        return base._prompt_items_to_voice_clone_prompt(prompt_items)
+
+    prompt_items = model.create_voice_clone_prompt(
+        ref_audio=args.reference_audio,
+        ref_text="",
+        x_vector_only_mode=True,
+    )
+    return model._prompt_items_to_voice_clone_prompt(prompt_items)
+
+
+def _load_voice_prompt(path: Path, device_hint: str):
+    torch = _import_torch()
+    target = device_hint if device_hint and device_hint.startswith("cuda") else None
+    prompt = torch.load(str(path), map_location=target or "cpu", weights_only=False)
+    return _move_prompt(prompt, target)
 
 
 def _generate_voice_clone(model, args: argparse.Namespace):
     kwargs = {
         "text": args.text,
         "language": args.language,
-        "ref_audio": args.reference_audio,
-        "ref_text": args.reference_text,
         "max_new_tokens": args.max_tokens,
         "temperature": args.temperature,
         "top_k": args.top_k,
@@ -103,11 +147,19 @@ def _generate_voice_clone(model, args: argparse.Namespace):
         "repetition_penalty": args.repetition_penalty,
     }
 
+    if args.prompt_artifact:
+        kwargs["voice_clone_prompt"] = _load_voice_prompt(Path(args.prompt_artifact), args.device_map)
+    else:
+        kwargs["ref_audio"] = args.reference_audio
+        kwargs["ref_text"] = args.reference_text
+
     if args.backend == "faster":
-        kwargs["xvec_only"] = args.xvec_only
+        if not args.prompt_artifact:
+            kwargs["xvec_only"] = args.xvec_only
         kwargs["non_streaming_mode"] = args.non_streaming_mode
     else:
-        kwargs["x_vector_only_mode"] = args.xvec_only
+        if not args.prompt_artifact:
+            kwargs["x_vector_only_mode"] = args.xvec_only
         kwargs["non_streaming_mode"] = args.non_streaming_mode
 
     return model.generate_voice_clone(**kwargs)
@@ -115,10 +167,12 @@ def _generate_voice_clone(model, args: argparse.Namespace):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["full", "encode_reference", "synth_preencoded"], default="full")
     parser.add_argument("--backend", choices=["official", "faster"], required=True)
     parser.add_argument("--repo", default="")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--prompt-artifact", default="")
     parser.add_argument("--text", required=True)
     parser.add_argument("--language", default="English")
     parser.add_argument("--reference-audio", required=True)
@@ -144,6 +198,27 @@ def main() -> int:
         model = _load_faster(args)
     _sync_cuda()
     load_s = time.perf_counter() - t_load0
+
+    if args.mode == "encode_reference":
+        t0 = time.perf_counter()
+        prompt = _create_voice_prompt(model, args)
+        _sync_cuda()
+        encode_s = time.perf_counter() - t0
+        artifact = Path(args.prompt_artifact)
+        if not artifact:
+            raise ValueError("--prompt-artifact is required for --mode encode_reference")
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        torch = _import_torch()
+        torch.save(_move_prompt(prompt), str(artifact))
+        result = {
+            "backend": args.backend,
+            "artifact": str(artifact),
+            "load_seconds": load_s,
+            "encode_seconds": encode_s,
+            "wall_seconds": load_s + encode_s,
+        }
+        print("BENCHMARK_JSON " + json.dumps(result, sort_keys=True))
+        return 0
 
     t0 = time.perf_counter()
     wavs, sample_rate = _generate_voice_clone(model, args)
