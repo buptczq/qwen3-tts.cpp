@@ -137,9 +137,17 @@ Quantize a converted model with the native tool:
 ```bash
 ./build/qwen3-tts-quantize \
   models/qwen3-tts-0.6b-f16.gguf \
-  models/qwen3-tts-0.6b-q4_k.gguf \
-  q4_k
+  models/qwen3-tts-0.6b-q4_k_m.gguf \
+  q4_k_m
 ```
+
+Supported output policies include `bf16`, `q8_0`, `q4_k`, `q4_k_m`,
+`q5_k_m`, `q6_k`, and the lower-bit K-quant variants. The `*_k_m`
+variants use a mixed policy similar to llama.cpp-style quantization:
+most transformer matrices use the base K-quant type, while selected
+attention value and FFN down-projection matrices are kept at a higher
+precision. Audio-critical tokenizer/vocoder weights and embedding lookup
+tables are intentionally left in their source precision.
 
 ## Usage
 
@@ -403,7 +411,7 @@ This repository is actively evolving. The current focus areas are:
 
 Known notes:
 
-- Quantized GGUF support is currently strongest for the TTS transformer. Audio-critical tokenizer/vocoder paths are expected to keep F16/F32-style weights.
+- Quantized GGUF support is strongest for the TTS transformer. Audio-critical tokenizer/vocoder paths and embedding lookup tables are intentionally kept in F16/F32-style precision.
 - `--top-p` is parsed and exposed in parameters, but sampling behavior should be verified when changing decoding code.
 - Autoregressive generation can diverge from Python even when logits are very close; audio quality is the primary end-to-end check.
 - Benchmarks should always include model dtype, backend, hardware, prompt length, and audio duration.
