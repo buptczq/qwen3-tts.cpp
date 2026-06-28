@@ -118,8 +118,7 @@ bool Qwen3TTS::load_models(const std::string & model_dir, const std::string & mo
             if (ext == ".gguf") {
                 if (filename_lower.find("tokenizer") != std::string::npos) {
                     tokenizer_candidates.push_back(entry.path());
-                } else if (filename_lower.find("qwen3-tts") != std::string::npos ||
-                           filename_lower.find("qwen-talker") != std::string::npos ||
+                } else if (filename_lower.find("qwen-talker") != std::string::npos ||
                            filename_lower.find("full") != std::string::npos) {
                     tts_candidates.push_back(entry.path());
                     if (!model_name.empty()) {
@@ -138,19 +137,12 @@ bool Qwen3TTS::load_models(const std::string & model_dir, const std::string & mo
         if (!model_name.empty()) {
             tts_model_path = model_dir + "/" + model_name;
         } else {
-            tts_model_path = model_dir + "/qwen3-tts-0.6b-f16.gguf";
+            tts_model_path = model_dir + "/qwen-talker-0.6b-base-Q8_0.gguf";
         }
     }
     const auto choose_tokenizer = [&](const bool prefer_qwen_talker) -> std::string {
-        const std::vector<std::string> preferred_exact = prefer_qwen_talker
-            ? std::vector<std::string>{
-                "qwen-tokenizer-12hz-q8_0.gguf",
-                "qwen-tokenizer-12hz-bf16.gguf",
-                "qwen-tokenizer-12hz-f32.gguf",
-                "qwen3-tts-tokenizer-f16.gguf",
-            }
-            : std::vector<std::string>{
-                "qwen3-tts-tokenizer-f16.gguf",
+        const std::vector<std::string> preferred_exact =
+            std::vector<std::string>{
                 "qwen-tokenizer-12hz-q8_0.gguf",
                 "qwen-tokenizer-12hz-bf16.gguf",
                 "qwen-tokenizer-12hz-f32.gguf",
@@ -170,9 +162,6 @@ bool Qwen3TTS::load_models(const std::string & model_dir, const std::string & mo
             if (prefer_qwen_talker && filename.find("qwen-tokenizer-12hz") != std::string::npos) {
                 return path.string();
             }
-            if (!prefer_qwen_talker && filename.find("qwen3-tts-tokenizer") != std::string::npos) {
-                return path.string();
-            }
         }
         if (!tokenizer_candidates.empty()) {
             return tokenizer_candidates.front().string();
@@ -187,7 +176,7 @@ bool Qwen3TTS::load_models(const std::string & model_dir, const std::string & mo
         tokenizer_model_path = choose_tokenizer(prefer_qwen_talker_tokenizer);
     }
     if (tokenizer_model_path.empty()) {
-        tokenizer_model_path = model_dir + "/qwen3-tts-tokenizer-f16.gguf";
+        tokenizer_model_path = model_dir + "/qwen-tokenizer-12hz-Q8_0.gguf";
     }
 
     fprintf(stderr, "  TTS model path:       %s\n", tts_model_path.c_str());
