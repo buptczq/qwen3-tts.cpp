@@ -603,17 +603,13 @@ bool SpeechTokenizerEncoder::load_model(const std::string & tokenizer_model_path
         error_msg_ = "Failed to materialize semantic codebook";
         return false;
     }
-    // Encode only ever accesses acoustic codebooks 0..n_valid_quantizers-2
-    // (loop bound: `q < valid_quantizers - 1`). Converters may omit the rest,
-    // so only require the codebooks that will actually be read.
-    const int32_t n_acoustic_needed = cfg.n_valid_quantizers > 0
-        ? (int32_t) cfg.n_valid_quantizers - 1
-        : 0;
+    if (cfg.n_valid_quantizers < 1 || cfg.n_valid_quantizers > 16) {
+        error_msg_ = "Unsupported speech tokenizer valid quantizer count";
+        return false;
+    }
     model.vq_acoustic_codebook_f32.assign(31, {});
-    for (int i = 0; i < 31; ++i) {
-        if (i >= n_acoustic_needed) {
-            continue;
-        }
+    const int32_t acoustic_codebooks_needed = cfg.n_valid_quantizers - 1;
+    for (int i = 0; i < acoustic_codebooks_needed; ++i) {
         if (!model.vq_acoustic_codebook[i]) {
             error_msg_ = "Speech tokenizer encoder GGUF is missing acoustic VQ codebook " + std::to_string(i);
             return false;
