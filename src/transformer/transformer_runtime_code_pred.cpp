@@ -1,79 +1,16 @@
 #include "tts_transformer.h"
 #include "transformer/transformer_state_internal.h"
 #include "transformer/transformer_internal.h"
+#include "transformer/transformer_sampling.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <random>
 #include <utility>
 #include <vector>
 
 namespace qwen3_tts {
-
-namespace {
-
-int32_t argmax_code_pred(const float * data, int32_t n) {
-    int32_t max_idx = 0;
-    float max_val = data[0];
-    for (int32_t i = 1; i < n; ++i) {
-        if (data[i] > max_val) {
-            max_val = data[i];
-            max_idx = i;
-        }
-    }
-    return max_idx;
-}
-
-void apply_top_p_code_pred(float * logits, int32_t n, float top_p) {
-    if (top_p <= 0.0f || top_p >= 1.0f) {
-        return;
-    }
-
-    float max_logit = -INFINITY;
-    for (int32_t i = 0; i < n; ++i) {
-        if (std::isfinite(logits[i]) && logits[i] > max_logit) {
-            max_logit = logits[i];
-        }
-    }
-    if (!std::isfinite(max_logit)) {
-        return;
-    }
-
-    std::vector<std::pair<float, int32_t>> sorted;
-    sorted.reserve(n);
-    double sum = 0.0;
-    for (int32_t i = 0; i < n; ++i) {
-        if (!std::isfinite(logits[i])) {
-            continue;
-        }
-        const float p = expf(logits[i] - max_logit);
-        sorted.push_back({p, i});
-        sum += p;
-    }
-    if (sum <= 0.0 || sorted.empty()) {
-        return;
-    }
-
-    for (auto & item : sorted) {
-        item.first = (float) ((double) item.first / sum);
-    }
-    std::sort(sorted.begin(), sorted.end(),
-              [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                  return a.first > b.first;
-              });
-
-    float cumulative = 0.0f;
-    for (size_t i = 0; i < sorted.size(); ++i) {
-        if (i > 0 && cumulative >= top_p) {
-            logits[sorted[i].second] = -INFINITY;
-        }
-        cumulative += sorted[i].first;
-    }
-}
-
-} // namespace
 
 bool TTSTransformer::get_hidden_states(std::vector<float> & hidden) const {
     if (last_hidden_.empty()) {
@@ -142,6 +79,8 @@ bool transformer_internal::ops::predict_codes_autoregressive_coreml(TTSTransform
                                                                     float temperature,
                                                                     int32_t top_k,
                                                                     float top_p,
+                                                                    int64_t seed,
+                                                                    int64_t * sampling_subseq,
                                                                     int32_t trace_frame) {
     auto & impl = self.impl_;
     auto & error_msg = self.error_msg_;
@@ -157,8 +96,9 @@ bool transformer_internal::ops::predict_codes_autoregressive_coreml(TTSTransform
 
     output.resize(n_steps);
     std::vector<float> logits_data(cfg.code_pred_vocab_size);
-    std::vector<float> code_probs(cfg.code_pred_vocab_size);
     std::vector<float> seq_embd((size_t) 16 * cfg.hidden_size, 0.0f);
+    int64_t local_subseq = sampling_subseq ? *sampling_subseq : 0;
+    transformer_sampling_state sampling{resolve_sampling_seed(seed), local_subseq};
 
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
@@ -166,45 +106,9 @@ bool transformer_internal::ops::predict_codes_autoregressive_coreml(TTSTransform
 #endif
 
     auto sample_or_argmax = [&](float * logits_ptr, int32_t vocab_size) -> int32_t {
-        if (temperature <= 0.0f) {
-            return argmax_code_pred(logits_ptr, vocab_size);
-        }
-
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            logits_ptr[i] /= temperature;
-        }
-
-        if (top_k > 0 && top_k < vocab_size) {
-            std::vector<std::pair<float, int32_t>> scored(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                scored[i] = {logits_ptr[i], i};
-            }
-            std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                    return a.first > b.first;
-                });
-            float threshold = scored[top_k - 1].first;
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                if (logits_ptr[i] < threshold) {
-                    logits_ptr[i] = -INFINITY;
-                }
-            }
-        }
-
-        apply_top_p_code_pred(logits_ptr, vocab_size, top_p);
-
-        float max_logit = *std::max_element(logits_ptr, logits_ptr + vocab_size);
-        double sum = 0.0;
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = expf(logits_ptr[i] - max_logit);
-            sum += code_probs[i];
-        }
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = (float) (code_probs[i] / sum);
-        }
-
-        std::discrete_distribution<int32_t> dist(code_probs.begin(), code_probs.begin() + vocab_size);
-        return dist(impl->rng);
+        return transformer_sample_top_k_p(logits_ptr, vocab_size,
+                                          temperature, top_k, top_p,
+                                          1.0f, nullptr, 0, sampling);
     };
 
     memcpy(seq_embd.data(), hidden, (size_t) cfg.hidden_size * sizeof(float));
@@ -282,6 +186,9 @@ bool transformer_internal::ops::predict_codes_autoregressive_coreml(TTSTransform
                                                     "i32", {(int64_t) output.size()});
     }
 
+    if (sampling_subseq) {
+        *sampling_subseq = sampling.subseq;
+    }
     return true;
 }
 
@@ -289,6 +196,8 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
                                                   std::vector<int32_t> & output,
                                                   float temperature, int32_t top_k,
                                                   float top_p,
+                                                  int64_t seed,
+                                                  int64_t * sampling_subseq,
                                                   int32_t trace_frame) {
     if (!impl_->model.ctx) {
         error_msg_ = "Model not loaded";
@@ -305,7 +214,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #endif
 
     if (impl_->use_coreml_code_predictor && impl_->coreml_code_predictor.is_loaded()) {
-        if (transformer_internal::ops::predict_codes_autoregressive_coreml(*this, hidden, codebook_0_token, output, temperature, top_k, top_p, trace_frame)) {
+        if (transformer_internal::ops::predict_codes_autoregressive_coreml(*this, hidden, codebook_0_token, output, temperature, top_k, top_p, seed, sampling_subseq, trace_frame)) {
             return true;
         }
         if (impl_->skip_ggml_code_pred_layers) {
@@ -324,43 +233,13 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 
     output.resize(15);
     std::vector<float> logits_data(cfg.code_pred_vocab_size);
-    std::vector<float> code_probs(cfg.code_pred_vocab_size);
+    int64_t local_subseq = sampling_subseq ? *sampling_subseq : 0;
+    transformer_sampling_state sampling{resolve_sampling_seed(seed), local_subseq};
 
     auto sample_or_argmax = [&](float * logits_ptr, int32_t vocab_size) -> int32_t {
-        if (temperature <= 0.0f) {
-            return argmax_code_pred(logits_ptr, vocab_size);
-        }
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            logits_ptr[i] /= temperature;
-        }
-        if (top_k > 0 && top_k < vocab_size) {
-            std::vector<std::pair<float, int32_t>> scored(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                scored[i] = {logits_ptr[i], i};
-            }
-            std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                    return a.first > b.first;
-                });
-            float threshold = scored[top_k - 1].first;
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                if (logits_ptr[i] < threshold) {
-                    logits_ptr[i] = -INFINITY;
-                }
-            }
-        }
-        apply_top_p_code_pred(logits_ptr, vocab_size, top_p);
-        float max_logit = *std::max_element(logits_ptr, logits_ptr + vocab_size);
-        double sum = 0.0;
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = expf(logits_ptr[i] - max_logit);
-            sum += code_probs[i];
-        }
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = (float) (code_probs[i] / sum);
-        }
-        std::discrete_distribution<int32_t> dist(code_probs.begin(), code_probs.begin() + vocab_size);
-        return dist(impl_->rng);
+        return transformer_sample_top_k_p(logits_ptr, vocab_size,
+                                          temperature, top_k, top_p,
+                                          1.0f, nullptr, 0, sampling);
     };
 
     std::vector<float> cb0_embd(cfg.hidden_size);
@@ -629,6 +508,9 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
                                                     "i32", {(int64_t) output.size()});
     }
 
+    if (sampling_subseq) {
+        *sampling_subseq = sampling.subseq;
+    }
     return true;
 }
 

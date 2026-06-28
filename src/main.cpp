@@ -200,6 +200,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
+    fprintf(stderr, "  --seed <n>             RNG seed for sampling (default: -1=random)\n");
     fprintf(stderr, "  --max-tokens <n>       Maximum audio tokens (default: 4096)\n");
     fprintf(stderr, "  --repeat <n>           Run synthesis n times in one process (default: 1)\n");
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
@@ -363,6 +364,12 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             params.top_p = std::stof(args[i]);
+        } else if (arg == "--seed") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing seed value\n");
+                return 1;
+            }
+            params.seed = std::stoll(args[i]);
         } else if (arg == "--max-tokens") {
             if (++i >= (int) args.size()) {
                 fprintf(stderr, "Error: missing max-tokens value\n");

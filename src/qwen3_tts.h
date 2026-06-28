@@ -36,6 +36,9 @@ struct tts_params {
     
     // Top-k sampling (0 = disabled)
     int32_t top_k = 50;
+
+    // RNG seed for stochastic sampling (-1 = random per synthesis)
+    int64_t seed = -1;
     
     // Number of threads
     int32_t n_threads = 4;

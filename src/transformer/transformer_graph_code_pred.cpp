@@ -262,14 +262,11 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_prefill_graph(TT
 
         struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
 
-        Vfull = ggml_clamp(ctx0, Vfull, -65504.0f, 65504.0f);
-
         struct ggml_tensor * KQV_fa = ggml_flash_attn_ext(ctx0, Q, Kfull, Vfull, inp_mask, KQscale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(KQV_fa, GGML_PREC_F32);
         cur = ggml_cont_2d(ctx0, KQV_fa, n_head * head_dim, n_tokens);
         cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
         cur = ggml_add(ctx0, cur, inpL);
-        cur = ggml_clamp(ctx0, cur, -65504.0f, 65504.0f);
         struct ggml_tensor * inpFF = cur;
 
         cur = ggml_rms_norm(ctx0, inpFF, eps);
@@ -284,7 +281,6 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_prefill_graph(TT
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
 
         inpL = ggml_add(ctx0, cur, inpFF);
-        inpL = ggml_clamp(ctx0, inpL, -65504.0f, 65504.0f);
     }
 
     cur = inpL;
@@ -441,7 +437,6 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_step_graph(TTSTr
             v_cache->nb[1], v_cache->nb[2], 0);
 
         struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
-        V = ggml_clamp(ctx0, V, -65504.0f, 65504.0f);
 
         if (n_tokens == 1) {
             struct ggml_tensor * KQ_mask = ggml_get_tensor(ctx0, "inp_mask");

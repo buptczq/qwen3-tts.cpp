@@ -29,6 +29,8 @@ struct ops {
                                                     float temperature,
                                                     int32_t top_k,
                                                     float top_p,
+                                                    int64_t seed,
+                                                    int64_t * sampling_subseq,
                                                     int32_t trace_frame);
 
     static bool build_prefill_graph(TTSTransformer & self,

@@ -7,7 +7,6 @@
 #include "coreml_code_predictor.h"
 
 #include <map>
-#include <random>
 #include <string>
 #include <vector>
 #ifdef QWEN3_TTS_TIMING
@@ -133,7 +132,6 @@ struct tts_transformer_private {
     tts_transformer_model model;
     tts_transformer_state state;
     std::vector<ggml_fp16_t> embd_row_fp16_scratch;
-    std::mt19937 rng{std::random_device{}()};
     CoreMLCodePredictor coreml_code_predictor;
     bool use_coreml_code_predictor = false;
     std::string coreml_code_predictor_path;

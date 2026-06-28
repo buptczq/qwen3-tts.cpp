@@ -141,6 +141,8 @@ public:
                                        float temperature = 0.9f,
                                        int32_t top_k = 50,
                                        float top_p = 1.0f,
+                                       int64_t seed = -1,
+                                       int64_t * sampling_subseq = nullptr,
                                        int32_t trace_frame = -1);
     
     // Generate speech codes autoregressively
@@ -156,6 +158,7 @@ public:
                   float temperature = 0.9f,
                   int32_t top_k = 50,
                   float top_p = 1.0f,
+                  int64_t seed = -1,
                   const int32_t * instruct_tokens = nullptr,
                   int32_t n_instruct_tokens = 0,
                   const int32_t * reference_tokens = nullptr,
