@@ -45,6 +45,55 @@ bool has_speaker_encoder_tensors(const std::string & model_path) {
     return false;
 }
 
+int32_t get_talker_embedding_length(const std::string & model_path) {
+    GGUFLoader loader;
+    if (!loader.open(model_path)) {
+        return 1024;
+    }
+    return loader.get_u32("qwen3-tts.talker.embedding_length",
+                          loader.get_u32("qwen3-tts.embedding_length", 1024));
+}
+
+std::string choose_tts_model_path(const std::string & model_dir,
+                                  const std::string & model_name,
+                                  std::vector<fs::path> & tts_candidates) {
+    std::string tts_model_path;
+    tts_candidates.clear();
+
+    if (fs::exists(model_dir) && fs::is_directory(model_dir)) {
+        for (const auto & entry : fs::directory_iterator(model_dir)) {
+            if (!entry.is_regular_file()) continue;
+            std::string filename = entry.path().filename().string();
+            std::string filename_lower = to_lower(filename);
+            std::string ext = to_lower(entry.path().extension().string());
+
+            if (ext == ".gguf" &&
+                filename_lower.find("tokenizer") == std::string::npos &&
+                (filename_lower.find("qwen-talker") != std::string::npos ||
+                 filename_lower.find("full") != std::string::npos)) {
+                tts_candidates.push_back(entry.path());
+                if (!model_name.empty()) {
+                    if (filename.find(model_name) != std::string::npos) {
+                        tts_model_path = entry.path().string();
+                    }
+                } else if (tts_model_path.empty() || filename.find("0.6b") != std::string::npos) {
+                    tts_model_path = entry.path().string();
+                }
+            }
+        }
+    }
+
+    if (tts_model_path.empty()) {
+        if (!model_name.empty()) {
+            tts_model_path = model_dir + "/" + model_name;
+        } else {
+            tts_model_path = model_dir + "/qwen-talker-0.6b-base-Q8_0.gguf";
+        }
+    }
+
+    return tts_model_path;
+}
+
 std::string find_speaker_encoder_model(const std::string & tts_model_path,
                                        const std::vector<fs::path> & tts_candidates,
                                        int32_t expected_embedding_dim) {
@@ -256,6 +305,53 @@ bool Qwen3TTS::load_models(const std::string & model_dir, const std::string & mo
     int64_t t_end = get_time_ms();
     fprintf(stderr, "All models loaded in %lld ms\n", (long long) (t_end - t_start));
     log_memory_usage("load/end");
+
+    return true;
+}
+
+bool Qwen3TTS::load_speaker_encoder_only(const std::string & model_dir, const std::string & model_name) {
+    configure_ggml_logging_once();
+
+    int64_t t_start = get_time_ms();
+    log_memory_usage("speaker-load/start");
+
+    transformer_.unload_model();
+    audio_encoder_.unload_model();
+    speech_encoder_.unload_model();
+    audio_decoder_.unload_model();
+    voice_prompt_cache_ = {};
+    models_loaded_ = false;
+    encoder_loaded_ = false;
+    transformer_loaded_ = false;
+    speech_encoder_loaded_ = false;
+    decoder_loaded_ = false;
+
+    std::vector<fs::path> tts_candidates;
+    tts_model_path_ = choose_tts_model_path(model_dir, model_name, tts_candidates);
+    const int32_t expected_dim = get_talker_embedding_length(tts_model_path_);
+    speaker_encoder_model_path_ = find_speaker_encoder_model(tts_model_path_, tts_candidates, expected_dim);
+
+    if (speaker_encoder_model_path_.empty()) {
+        error_msg_ = "No speaker encoder tensors found for model: " + tts_model_path_;
+        return false;
+    }
+
+    fprintf(stderr, "  TTS model path:              %s\n", tts_model_path_.c_str());
+    fprintf(stderr, "  Speaker encoder model path:  %s\n", speaker_encoder_model_path_.c_str());
+
+    int64_t t_encoder_load_start = get_time_ms();
+    if (!audio_encoder_.load_model(speaker_encoder_model_path_)) {
+        error_msg_ = "Failed to load speaker encoder: " + audio_encoder_.get_error();
+        return false;
+    }
+    encoder_loaded_ = true;
+
+    fprintf(stderr, "  Speaker encoder loaded: embedding_dim=%d (%lld ms)\n",
+            audio_encoder_.get_config().embedding_dim,
+            (long long) (get_time_ms() - t_encoder_load_start));
+    fprintf(stderr, "Speaker encoder-only load complete in %lld ms\n",
+            (long long) (get_time_ms() - t_start));
+    log_memory_usage("speaker-load/end");
 
     return true;
 }

@@ -271,7 +271,7 @@ tts_result Qwen3TTS::synthesize_with_speaker_embedding(const std::string & text,
 bool Qwen3TTS::extract_speaker_embedding(const std::string & reference_audio,
                                          std::vector<float> & speaker_embedding,
                                          int64_t * encode_time_ms) {
-    if (!models_loaded_) {
+    if (!models_loaded_ && !encoder_loaded_) {
         error_msg_ = "Models not loaded";
         return false;
     }
@@ -313,7 +313,9 @@ bool Qwen3TTS::extract_speaker_embedding(const std::string & reference_audio,
         return false;
     }
 
-    const int expected_dim = transformer_.get_config().hidden_size;
+    const int expected_dim = transformer_loaded_
+        ? transformer_.get_config().hidden_size
+        : audio_encoder_.get_config().embedding_dim;
     if ((int) speaker_embedding.size() != expected_dim) {
         char buf[256];
         snprintf(buf, sizeof(buf),

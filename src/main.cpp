@@ -504,19 +504,14 @@ int main(int argc, char ** argv) {
     
     // Initialize TTS
     qwen3_tts::Qwen3TTS tts;
-    
-    fprintf(stderr, "Loading models from: %s\n", model_dir.c_str());
-    if (!tts.load_models(model_dir, model_name)) {
-        fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
-        return 1;
-    }
-    
-    // Set progress callback
-    tts.set_progress_callback([](int tokens, int max_tokens) {
-        fprintf(stderr, "\rGenerating: %d/%d tokens", tokens, max_tokens);
-    });
 
     if (!extract_speaker_embedding_file.empty()) {
+        fprintf(stderr, "Loading speaker encoder from: %s\n", model_dir.c_str());
+        if (!tts.load_speaker_encoder_only(model_dir, model_name)) {
+            fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
+            return 1;
+        }
+
         std::vector<float> speaker_embedding;
         int64_t encode_ms = 0;
         if (!tts.extract_speaker_embedding(reference_audio, speaker_embedding, &encode_ms)) {
@@ -532,7 +527,18 @@ int main(int argc, char ** argv) {
                 (long long) encode_ms, speaker_embedding.size());
         return 0;
     }
+
+    fprintf(stderr, "Loading models from: %s\n", model_dir.c_str());
+    if (!tts.load_models(model_dir, model_name)) {
+        fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
+        return 1;
+    }
     
+    // Set progress callback
+    tts.set_progress_callback([](int tokens, int max_tokens) {
+        fprintf(stderr, "\rGenerating: %d/%d tokens", tokens, max_tokens);
+    });
+
     std::vector<float> speaker_embedding_from_file;
     if (!speaker_embedding_file.empty()) {
         if (!qwen3_tts::load_speaker_embedding_file(speaker_embedding_file, speaker_embedding_from_file)) {

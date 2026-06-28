@@ -2,16 +2,12 @@
 
 Native C++17 / GGML inference for Qwen3-TTS.
 
-This repository is a heavily developed fork of the original
-[`predict-woo/qwen3-tts.cpp`](https://github.com/predict-woo/qwen3-tts.cpp).
-The current codebase now provides a fuller local runtime for Qwen3-TTS:
-GGUF model loading, text tokenization, speaker conditioning, autoregressive
-speech-code generation, and 24 kHz waveform decoding without Python or PyTorch
-at inference time.
+`qwen3-tts.cpp` provides a local runtime for Qwen3-TTS: GGUF model loading,
+text tokenization, speaker conditioning, autoregressive speech-code generation,
+and 24 kHz waveform decoding without Python or PyTorch at inference time.
 
-The primary tested development target is Windows. Linux builds use the normal
-CMake path and should work with the same GGML backend choices, but Linux
-verification may lag behind Windows.
+Windows with CUDA is the primary tested target. Linux uses the standard CMake
+build path and the same GGML backend options.
 
 ## Features
 
@@ -31,38 +27,31 @@ verification may lag behind Windows.
 - Native C++ API, C ABI, optional JNI target, and Kotlin wrapper sources
 - WAV validation, regression-test scripts, trace dumps, and timing instrumentation
 
-## Status
-
-This project is actively evolving. The Windows CUDA path is the most exercised
-configuration at the moment.
-
-Quantized GGUF support is available for transformer models. Audio-critical
-tokenizer/vocoder paths and embedding tables are intentionally kept in higher
-precision by the quantization policy.
-
 ## Benchmarks
 
 These numbers are local Windows CUDA measurements from the framework comparison
 harness. Each row is the average of three voice-clone runs. Speaker encoding is
 measured as a separate encode phase, and speech synthesis is measured with a
-precomputed speaker embedding. The GGUF Q8_0 rows were refreshed on 2026-06-28
-after the Serveurperso-compatible GGUF loader/converter update.
+precomputed speaker embedding.
 
 Test setup:
 
 - Windows, CUDA backend, NVIDIA GeForce RTX 5080 Laptop GPU 16 GB
 - `max_tokens=128`, `threads=4`, sampled decoding with temperature `0.9`,
   top-k `50`, top-p `1.0`, repetition penalty `1.05`
-- `Speaker encode` is the standalone encode phase wall time
-- `RTF` is computed from speech synthesis only: `audio seconds / synthesis seconds`
+- `Speaker encode` is the standalone encode command wall time; for
+  `qwen3-tts.cpp`, `--extract-speaker-embedding` loads only speaker-encoder
+  tensors, not the transformer or vocoder
+- `Speech synthesis` and `RTF` use the internal synthesis timer, excluding model
+  load time
 - Higher RTF is better
 
 ### 1.7B Base
 
 | Engine | Model / dtype | Speaker encode | Speech synthesis | Audio | RTF |
 |--------|---------------|----------------|------------------|-------|-----|
-| `qwen3-tts.cpp` | GGUF Q8_0 | 2.790 s | 1.470 s | 6.450 s | 4.400 |
-| `ServeurpersoCom/qwentts.cpp` | GGUF Q8_0 | 2.080 s | 3.260 s | 6.720 s | 2.060 |
+| `qwen3-tts.cpp` | GGUF Q8_0 | 1.890 s | 1.460 s | 6.670 s | 4.580 |
+| `ServeurpersoCom/qwentts.cpp` | GGUF Q8_0 | 2.530 s | 3.230 s | 6.720 s | 2.080 |
 | `audio.cpp` | HF weights, F16 | 1.380 s | 5.888 s | 5.600 s | 0.953 |
 | `faster-qwen3-tts` | HF weights, BF16 | 11.466 s | 17.832 s | 7.120 s | 0.401 |
 | Official Python | HF weights, BF16 | 12.160 s | 22.550 s | 6.800 s | 0.303 |
@@ -71,14 +60,13 @@ Test setup:
 
 | Engine | Model / dtype | Speaker encode | Speech synthesis | Audio | RTF |
 |--------|---------------|----------------|------------------|-------|-----|
-| `qwen3-tts.cpp` | GGUF Q8_0 | 1.970 s | 1.100 s | 6.160 s | 5.580 |
-| `ServeurpersoCom/qwentts.cpp` | GGUF Q8_0 | 2.040 s | 3.060 s | 6.480 s | 2.120 |
+| `qwen3-tts.cpp` | GGUF Q8_0 | 1.930 s | 1.240 s | 6.880 s | 5.580 |
+| `ServeurpersoCom/qwentts.cpp` | GGUF Q8_0 | 2.120 s | 2.950 s | 6.480 s | 2.200 |
 | `audio.cpp` | HF weights, F32 | 1.275 s | 5.777 s | 5.920 s | 1.025 |
 | `faster-qwen3-tts` | HF weights, BF16 | 12.391 s | 17.358 s | 6.400 s | 0.369 |
 | Official Python | HF weights, BF16 | 12.919 s | 23.348 s | 7.360 s | 0.315 |
 
-For 0.6B, `audio.cpp` was benchmarked with F32 weights because its F16 run
-failed with non-finite sampler logits on this setup.
+The 0.6B `audio.cpp` row uses F32 weights.
 
 The comparison harness is:
 
@@ -176,7 +164,10 @@ Run synthesis:
 
 ## Model Files
 
-The setup scripts create GGUF files under `models/`.
+Ready-to-use GGUF files are available from
+[`Serveurperso/Qwen3-TTS-GGUF`](https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF).
+Place the downloaded files under `models/`, or use the setup scripts to create
+compatible GGUF files locally.
 
 Typical files:
 
@@ -189,7 +180,7 @@ Typical files:
 | `qwen-talker-*-BF16.gguf` | BF16 talker variant, if generated |
 | `qwen-talker-*-Q4_K_M.gguf` | K-quant talker variant, if generated |
 
-Manual conversion is still available:
+Manual conversion:
 
 ```bash
 huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
@@ -459,6 +450,9 @@ python .\scripts\debug_trace_report.py --trace-a .\trace_cpp
 
 - Original fork base: [`predict-woo/qwen3-tts.cpp`](https://github.com/predict-woo/qwen3-tts.cpp)
 - Qwen3-TTS models by the [Alibaba Qwen team](https://huggingface.co/Qwen)
+- Simon Quinn / ServeurpersoCom for [`qwentts.cpp`](https://github.com/ServeurpersoCom/qwentts.cpp)
+  and ready-to-use GGUF releases at
+  [`Serveurperso/Qwen3-TTS-GGUF`](https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF)
 - [GGML](https://github.com/ggml-org/ggml), the tensor/runtime foundation used by this project
 - The wider llama.cpp / GGML community for backend, quantization, and runtime ideas
 

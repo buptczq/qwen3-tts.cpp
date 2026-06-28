@@ -134,6 +134,9 @@ public:
     // Load all models from directory
     // model_dir should contain: transformer.gguf, tokenizer.gguf, vocoder.gguf
     bool load_models(const std::string & model_dir, const std::string & model_name = "");
+
+    // Load only the speaker encoder tensors needed by extract_speaker_embedding().
+    bool load_speaker_encoder_only(const std::string & model_dir, const std::string & model_name = "");
     
     // Generate speech from text
     // text: input text to synthesize

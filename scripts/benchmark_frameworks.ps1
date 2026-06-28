@@ -169,6 +169,9 @@ function Get-BenchmarkInternalMetrics([string]$Implementation, [string]$LogText)
 
     if ($Implementation -eq "qwen_cpp") {
         $metrics.InternalLoadMs = Get-RegexMetric $LogText "All models loaded in\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        if ($null -eq $metrics.InternalLoadMs) {
+            $metrics.InternalLoadMs = Get-RegexMetric $LogText "Speaker encoder-only load complete in\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
+        }
         $metrics.InternalEncodeMs = Get-RegexMetric $LogText "^\s*Encode:\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
         if ($null -eq $metrics.InternalEncodeMs) {
             $metrics.InternalEncodeMs = Get-RegexMetric $LogText "^\s*Speaker encode:\s+([0-9]+(?:\.[0-9]+)?)\s+ms"
