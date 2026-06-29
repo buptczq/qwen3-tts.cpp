@@ -108,9 +108,10 @@ qwen3_tts_result_t qwen3_tts_synthesize(
 }
 
 qwen3_tts_result_t qwen3_tts_synthesize_with_voice(
-    qwen3_tts_context_t* ctx, 
-    const char* text, 
-    const char* reference_audio, 
+    qwen3_tts_context_t* ctx,
+    const char* text,
+    const char* reference_audio,
+    const char* reference_text,
     qwen3_tts_params_t params
 ) {
     if (!ctx || !text || !reference_audio) {
@@ -119,7 +120,11 @@ qwen3_tts_result_t qwen3_tts_synthesize_with_voice(
         res.error_msg = strdup("Invalid context, text, or reference audio");
         return res;
     }
-    auto result = ctx->tts.synthesize_with_voice(text, reference_audio, convert_params(params));
+    auto p = convert_params(params);
+    if (reference_text) {
+        p.reference_text = reference_text;
+    }
+    auto result = ctx->tts.synthesize_with_voice(text, reference_audio, p);
     return convert_result(result);
 }
 
@@ -174,6 +179,7 @@ qwen3_tts_result_t qwen3_tts_synthesize_with_voice_streaming(
     qwen3_tts_context_t* ctx,
     const char* text,
     const char* reference_audio,
+    const char* reference_text,
     qwen3_tts_streaming_params_t params,
     qwen3_tts_audio_chunk_callback callback,
     void* user_data
@@ -189,8 +195,11 @@ qwen3_tts_result_t qwen3_tts_synthesize_with_voice_streaming(
         [callback, user_data](const float* samples, int32_t n_samples, int32_t sample_rate) {
             return callback(samples, n_samples, sample_rate, user_data) != 0;
         };
-    auto result = ctx->tts.synthesize_with_voice_streaming(text, reference_audio, cb,
-                                                           convert_streaming_params(params));
+    auto sp = convert_streaming_params(params);
+    if (reference_text) {
+        sp.generation.reference_text = reference_text;
+    }
+    auto result = ctx->tts.synthesize_with_voice_streaming(text, reference_audio, cb, sp);
     return convert_result(result);
 }
 

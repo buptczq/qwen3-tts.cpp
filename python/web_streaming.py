@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """
-WebSocket streaming TTS server.
+WebSocket streaming TTS server with persistent reference audio.
 
-Protocol
+Reference audio is stored as JSON files in <refs_dir>/<name>.json:
+  {"name": "...", "reference_text": "...", "wav_base64": "...", "created_at": "..."}
+
+HTTP API
 --------
+POST   /api/refs              Upload reference audio (multipart: file + name + reference_text)
+GET    /api/refs              List all saved references (without wav data)
+GET    /api/refs/<name>       Get reference details (includes wav_base64)
+DELETE /api/refs/<name>       Delete a reference
+
+WebSocket API
+-------------
 Client -> Server (JSON):
-  {"text": "...", "params": {...}}   — enqueue a synthesis request
-  {"type": "cancel"}                 — cancel the currently playing request
+  {"text": "...", "params": {"ref_name": "..."}}  — enqueue synthesis
+  {"type": "cancel"}                                — cancel current synthesis
 
 Server -> Client (JSON lines):
   {"type": "queued",    "position": N}
@@ -28,6 +38,8 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -40,6 +52,59 @@ from qwen3_tts import Qwen3TTS
 logger = logging.getLogger("web_streaming")
 
 SAMPLE_RATE = 24000
+
+# ── reference audio persistence ─────────────────────────────────────────────
+
+
+def _load_refs(refs_dir: Path) -> list[dict]:
+    """Load all reference metadata (without wav data) from refs_dir."""
+    refs = []
+    if not refs_dir.exists():
+        return refs
+    for f in sorted(refs_dir.iterdir()):
+        if f.suffix == ".json":
+            try:
+                data = json.loads(f.read_text("utf-8"))
+                refs.append({
+                    "name": data["name"],
+                    "reference_text": data.get("reference_text", ""),
+                    "created_at": data.get("created_at", ""),
+                    "size": len(data.get("wav_base64", "")),
+                })
+            except Exception as e:
+                logger.warning("Failed to load ref %s: %s", f.name, e)
+    return refs
+
+
+def _save_ref(refs_dir: Path, name: str, wav_base64: str, reference_text: str):
+    """Save a reference audio as a JSON file."""
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "name": name,
+        "reference_text": reference_text,
+        "wav_base64": wav_base64,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path = refs_dir / f"{name}.json"
+    path.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+
+
+def _delete_ref(refs_dir: Path, name: str) -> bool:
+    path = refs_dir / f"{name}.json"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def _get_ref_full(refs_dir: Path, name: str) -> Optional[dict]:
+    path = refs_dir / f"{name}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except Exception:
+        return None
 
 
 def pcm16_encode(samples: np.ndarray) -> bytes:
@@ -59,15 +124,16 @@ class Request:
     cancelled: bool = False
 
 
-_CHUNK_END = None  # sentinel to signal end of chunk stream
+_CHUNK_END = None
 
 
 class ClientSession:
     """Manages a queue of synthesis requests for one WebSocket connection."""
 
-    def __init__(self, tts: Qwen3TTS, ws):
+    def __init__(self, tts: Qwen3TTS, ws, refs_dir: Path):
         self._tts = tts
         self._ws = ws
+        self._refs_dir = refs_dir
         self._queue: deque[Request] = deque()
         self._current: Optional[Request] = None
         self._cancel_event = asyncio.Event()
@@ -92,8 +158,6 @@ class ClientSession:
 
     def cancel_current(self):
         self._cancel_event.set()
-
-    # ── worker ──────────────────────────────────────────────────────────
 
     async def _worker_loop(self):
         while True:
@@ -139,15 +203,28 @@ class ClientSession:
         }
         params.update(req.params)
 
-        # Queue: thread puts np.ndarray chunks, async task gets them
+        # Resolve reference audio from persisted refs
+        ref_name = params.pop("ref_name", None)
+        ref_path: Optional[str] = None
+        ref_text: Optional[str] = None
+        if ref_name:
+            ref_data = _get_ref_full(self._refs_dir, ref_name)
+            if ref_data is None:
+                logger.warning("ref_name '%s' not found, falling back to no voice clone", ref_name)
+            else:
+                # Decode wav to a temp file for the C API
+                wav_bytes = base64.b64decode(ref_data["wav_base64"])
+                tmp_path = self._refs_dir / f"_{uuid.uuid4().hex}.wav"
+                tmp_path.write_bytes(wav_bytes)
+                ref_path = str(tmp_path)
+                ref_text = ref_data.get("reference_text") or None
+
         chunk_queue: asyncio.Queue = asyncio.Queue()
 
         def _run():
-            """Blocking function run in executor thread."""
             def _on_chunk(samples: np.ndarray, sr: int) -> bool:
                 if self._cancel_event.is_set():
                     return False
-                # Put chunk into the async queue
                 fut = asyncio.run_coroutine_threadsafe(
                     chunk_queue.put(samples), loop
                 )
@@ -155,14 +232,27 @@ class ClientSession:
                 return True
 
             try:
-                self._tts.synthesize_streaming(
-                    req.text, on_audio_chunk=_on_chunk, **params,
-                )
+                if ref_path:
+                    self._tts.synthesize_with_voice_streaming(
+                        req.text, ref_path,
+                        on_audio_chunk=_on_chunk,
+                        reference_text=ref_text,
+                        **params,
+                    )
+                else:
+                    self._tts.synthesize_streaming(
+                        req.text, on_audio_chunk=_on_chunk, **params,
+                    )
             except Exception as e:
                 asyncio.run_coroutine_threadsafe(
                     chunk_queue.put(e), loop
                 ).result()
             finally:
+                if ref_path:
+                    try:
+                        Path(ref_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 asyncio.run_coroutine_threadsafe(
                     chunk_queue.put(_CHUNK_END), loop
                 ).result()
@@ -170,14 +260,12 @@ class ClientSession:
         loop = asyncio.get_running_loop()
         thread_task = loop.run_in_executor(None, _run)
 
-        # Read chunks from the queue and send them
         while True:
             item = await chunk_queue.get()
             if item is _CHUNK_END:
                 break
             if isinstance(item, Exception):
                 raise item
-            # item is np.ndarray
             if req.cancelled:
                 break
             pcm = pcm16_encode(item)
@@ -199,8 +287,8 @@ class ClientSession:
 
 # ── WebSocket handler ──────────────────────────────────────────────────────
 
-async def handler(ws, tts: Qwen3TTS):
-    session = ClientSession(tts, ws)
+async def ws_handler(ws, tts: Qwen3TTS, refs_dir: Path):
+    session = ClientSession(tts, ws, refs_dir)
     await session.start()
     try:
         async for msg in ws:
@@ -230,6 +318,64 @@ async def handler(ws, tts: Qwen3TTS):
         await session.stop()
 
 
+# ── HTTP API handlers ──────────────────────────────────────────────────────
+
+async def handle_list_refs(request):
+    refs_dir: Path = request.app["refs_dir"]
+    return web.json_response(_load_refs(refs_dir))
+
+
+async def handle_get_ref(request):
+    refs_dir: Path = request.app["refs_dir"]
+    name = request.match_info["name"]
+    data = _get_ref_full(refs_dir, name)
+    if data is None:
+        return web.json_response({"error": "not found"}, status=404)
+    return web.json_response(data)
+
+
+async def handle_delete_ref(request):
+    refs_dir: Path = request.app["refs_dir"]
+    name = request.match_info["name"]
+    if _delete_ref(refs_dir, name):
+        return web.json_response({"status": "deleted"})
+    return web.json_response({"error": "not found"}, status=404)
+
+
+async def handle_upload_ref(request):
+    refs_dir: Path = request.app["refs_dir"]
+    reader = await request.multipart()
+
+    name = None
+    reference_text = ""
+    wav_bytes = None
+
+    async for part in reader:
+        if part.name == "name":
+            name = (await part.read()).decode("utf-8").strip()
+        elif part.name == "reference_text":
+            reference_text = (await part.read()).decode("utf-8").strip()
+        elif part.name == "file":
+            wav_bytes = await part.read()
+
+    if not name:
+        return web.json_response({"error": "name is required"}, status=400)
+    if not wav_bytes:
+        return web.json_response({"error": "file is required"}, status=400)
+    if not wav_bytes.startswith(b"RIFF"):
+        return web.json_response({"error": "file is not a valid WAV"}, status=400)
+
+    wav_base64 = base64.b64encode(wav_bytes).decode("ascii")
+    _save_ref(refs_dir, name, wav_base64, reference_text)
+
+    logger.info("Saved reference audio: %s", name)
+    return web.json_response({
+        "name": name,
+        "reference_text": reference_text,
+        "size": len(wav_bytes),
+    })
+
+
 # ── HTTP index page ────────────────────────────────────────────────────────
 
 INDEX_HTML = """<!DOCTYPE html>
@@ -243,7 +389,8 @@ INDEX_HTML = """<!DOCTYPE html>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          background: #f5f5f5; height: 100vh; display: flex; flex-direction: column; }
   #header { background: #1a73e8; color: #fff; padding: 14px 20px; font-size: 18px;
-            font-weight: 600; flex-shrink: 0; }
+            font-weight: 600; flex-shrink: 0; display: flex; align-items: center; gap: 12px; }
+  #header .sub { font-size: 12px; font-weight: 400; opacity: .8; }
   #chat { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex;
           flex-direction: column; gap: 10px; }
   .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.5;
@@ -266,6 +413,8 @@ INDEX_HTML = """<!DOCTYPE html>
   .btn-danger:hover { background: #b71c1c; }
   .btn-secondary { background: #e0e0e0; color: #333; }
   .btn-secondary:hover { background: #bdbdbd; }
+  .btn-success { background: #2e7d32; color: #fff; }
+  .btn-success:hover { background: #1b5e20; }
   #params-panel { flex-shrink: 0; background: #fff; border-top: 1px solid #e0e0e0;
                   padding: 12px 20px; display: none; flex-wrap: wrap; gap: 12px;
                   align-items: center; }
@@ -276,6 +425,25 @@ INDEX_HTML = """<!DOCTYPE html>
                  border-radius: 4px; font-size: 13px; }
   .param input[type="range"] { width: 100px; }
   .param .val { font-size: 12px; color: #1a73e8; min-width: 24px; text-align: right; }
+  #ref-bar { flex-shrink: 0; background: #fff; border-top: 1px solid #e0e0e0;
+             padding: 8px 20px; display: flex; gap: 8px; align-items: center;
+             font-size: 13px; flex-wrap: wrap; }
+  #ref-bar .label { color: #555; }
+  #ref-bar select { padding: 4px 8px; border: 1px solid #dadce0; border-radius: 4px;
+                    font-size: 13px; min-width: 150px; }
+  #ref-bar input[type="file"] { display: none; }
+  #upload-dialog { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+                   background: rgba(0,0,0,0.4); align-items: center; justify-content: center;
+                   z-index: 100; }
+  #upload-dialog.open { display: flex; }
+  #upload-dialog .box { background: #fff; border-radius: 12px; padding: 24px; width: 420px;
+                        max-width: 90vw; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+  #upload-dialog h3 { margin-bottom: 16px; }
+  #upload-dialog label { display: block; font-size: 13px; color: #555; margin: 8px 0 4px; }
+  #upload-dialog input, #upload-dialog textarea { width: 100%; padding: 8px 10px;
+    border: 1px solid #dadce0; border-radius: 6px; font-size: 14px; }
+  #upload-dialog textarea { resize: vertical; min-height: 50px; }
+  #upload-dialog .btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   #connect-bar { flex-shrink: 0; padding: 8px 20px; background: #fff3e0;
                  border-bottom: 1px solid #ffe0b2; font-size: 13px; display: none; }
   #connect-bar.error { background: #ffebee; border-color: #ffcdd2; display: block; }
@@ -283,9 +451,18 @@ INDEX_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div id="header">Qwen3-TTS 流式合成</div>
+<div id="header">Qwen3-TTS 流式合成 <span class="sub">voice clone</span></div>
 <div id="connect-bar"></div>
 <div id="chat"></div>
+<div id="ref-bar">
+  <span class="label">参考音频:</span>
+  <select id="ref-select">
+    <option value="">不使用</option>
+  </select>
+  <button class="btn btn-secondary" id="btn-refresh" style="padding:4px 8px;font-size:12px">刷新</button>
+  <button class="btn btn-success" id="btn-add-ref" style="padding:4px 12px;font-size:12px">+ 新建</button>
+  <button class="btn btn-danger" id="btn-del-ref" style="padding:4px 12px;font-size:12px;display:none">删除</button>
+</div>
 <div id="params-panel">
   <div class="param"><label>温度</label>
     <input type="range" id="p-temp" min="0" max="2" step="0.1" value="0.7">
@@ -325,6 +502,25 @@ INDEX_HTML = """<!DOCTYPE html>
   <button class="btn btn-secondary" id="btn-params">参数</button>
 </div>
 
+<!-- Upload dialog -->
+<div id="upload-dialog">
+  <div class="box">
+    <h3>新建参考音频</h3>
+    <label>名称</label>
+    <input type="text" id="up-name" placeholder="e.g. my_voice">
+    <label>参考文本 (音频内容)</label>
+    <textarea id="up-text" placeholder="音频里说的内容"></textarea>
+    <label>上传 WAV 文件</label>
+    <input type="file" id="up-file" accept=".wav,audio/wav">
+    <label>或录音</label>
+    <button class="btn btn-secondary" id="up-record" style="width:100%">开始录音</button>
+    <div class="btns">
+      <button class="btn btn-secondary" id="up-cancel">取消</button>
+      <button class="btn btn-primary" id="up-save">保存</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
 const wsUrl = wsProto + "//" + location.host;
@@ -332,6 +528,9 @@ let ws = null;
 let currentReqId = null;
 let audioCtx = null;
 let gainNode = null;
+let mediaRecorder = null;
+let recordingChunks = [];
+let selectedRef = "";
 
 function connect() {
   ws = new WebSocket(wsUrl);
@@ -416,6 +615,12 @@ function base64ToBytes(b64) {
   return bytes;
 }
 
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
 function addSystemMsg(text, isError) {
   const chat = document.getElementById("chat");
   const div = document.createElement("div");
@@ -463,9 +668,190 @@ function sendText() {
   if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
   addUserMsg(text);
   const params = getParams();
+  if (selectedRef) {
+    params.ref_name = selectedRef;
+  }
   ws.send(JSON.stringify({ text, params }));
   input.value = "";
 }
+
+// ── reference audio management ─────────────────────────────────────────
+
+async function loadRefs() {
+  try {
+    const resp = await fetch("/api/refs");
+    const refs = await resp.json();
+    const sel = document.getElementById("ref-select");
+    const current = sel.value;
+    sel.innerHTML = '<option value="">不使用</option>';
+    for (const r of refs) {
+      const opt = document.createElement("option");
+      opt.value = r.name;
+      opt.textContent = r.name + (r.reference_text ? " (" + r.reference_text.substring(0, 30) + ")" : "");
+      sel.appendChild(opt);
+    }
+    if ([...sel.options].some(o => o.value === current)) {
+      sel.value = current;
+    }
+    onRefChange();
+  } catch (e) {
+    addSystemMsg("加载参考音频列表失败: " + e.message, true);
+  }
+}
+
+function onRefChange() {
+  selectedRef = document.getElementById("ref-select").value;
+  document.getElementById("btn-del-ref").style.display = selectedRef ? "" : "none";
+}
+
+document.getElementById("ref-select").onchange = onRefChange;
+document.getElementById("btn-refresh").onclick = loadRefs;
+
+document.getElementById("btn-del-ref").onclick = async () => {
+  if (!selectedRef) return;
+  if (!confirm("删除参考音频 '" + selectedRef + "'?")) return;
+  try {
+    const resp = await fetch("/api/refs/" + encodeURIComponent(selectedRef), { method: "DELETE" });
+    if (resp.ok) {
+      addSystemMsg("已删除: " + selectedRef);
+      selectedRef = "";
+      await loadRefs();
+    }
+  } catch (e) {
+    addSystemMsg("删除失败: " + e.message, true);
+  }
+};
+
+// ── upload dialog ──────────────────────────────────────────────────────
+
+document.getElementById("btn-add-ref").onclick = () => {
+  document.getElementById("upload-dialog").classList.add("open");
+};
+
+document.getElementById("up-cancel").onclick = () => {
+  document.getElementById("upload-dialog").classList.remove("open");
+};
+
+document.getElementById("up-save").onclick = async () => {
+  const name = document.getElementById("up-name").value.trim();
+  const refText = document.getElementById("up-text").value.trim();
+  const fileInput = document.getElementById("up-file");
+  const file = fileInput.files[0];
+
+  if (!name) { alert("请输入名称"); return; }
+  if (!file) { alert("请选择 WAV 文件或录音"); return; }
+
+  const form = new FormData();
+  form.append("name", name);
+  form.append("reference_text", refText);
+  form.append("file", file);
+
+  try {
+    const resp = await fetch("/api/refs", { method: "POST", body: form });
+    if (resp.ok) {
+      addSystemMsg("参考音频已保存: " + name);
+      document.getElementById("upload-dialog").classList.remove("open");
+      document.getElementById("up-name").value = "";
+      document.getElementById("up-text").value = "";
+      fileInput.value = "";
+      await loadRefs();
+      document.getElementById("ref-select").value = name;
+      onRefChange();
+    } else {
+      const err = await resp.json();
+      alert("上传失败: " + (err.error || resp.status));
+    }
+  } catch (e) {
+    alert("上传失败: " + e.message);
+  }
+};
+
+// ── recording in upload dialog ─────────────────────────────────────────
+
+document.getElementById("up-record").onclick = async () => {
+  const btn = document.getElementById("up-record");
+  if (mediaRecorder && mediaRecorder.state === "recording") {
+    mediaRecorder.stop();
+    btn.textContent = "开始录音";
+    btn.className = "btn btn-secondary";
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+    recordingChunks = [];
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) recordingChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(recordingChunks, { type: "audio/webm;codecs=opus" });
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const ab = await blob.arrayBuffer();
+        const decoded = await ctx.decodeAudioData(ab);
+        const numChannels = decoded.numberOfChannels;
+        const length = decoded.length;
+        const sr = decoded.sampleRate;
+        const mono = new Float32Array(length);
+        for (let i = 0; i < numChannels; i++) {
+          const ch = decoded.getChannelData(i);
+          for (let s = 0; s < length; s++) mono[s] += ch[s] / numChannels;
+        }
+        const wav = encodeWav(mono, sr);
+        const wavFile = new File([wav], "recording.wav", { type: "audio/wav" });
+        const dt = new DataTransfer();
+        dt.items.add(wavFile);
+        document.getElementById("up-file").files = dt.files;
+        addSystemMsg("录音完成: " + (wav.byteLength / 1024).toFixed(0) + "KB");
+        ctx.close();
+      } catch (err) {
+        addSystemMsg("录音转码失败: " + err.message, true);
+      }
+    };
+
+    mediaRecorder.start();
+    btn.textContent = "停止录音";
+    btn.className = "btn btn-danger";
+  } catch (err) {
+    addSystemMsg("录音启动失败: " + err.message, true);
+  }
+};
+
+function encodeWav(samples, sampleRate) {
+  const len = samples.length;
+  const dataLen = len * 2;
+  const buf = new ArrayBuffer(44 + dataLen);
+  const view = new DataView(buf);
+  const writeStr = (off, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataLen, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataLen, true);
+  let off = 44;
+  for (let i = 0; i < len; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(off, s * 32767, true);
+    off += 2;
+  }
+  return new Uint8Array(buf);
+}
+
+// ── event bindings ─────────────────────────────────────────────────────
 
 document.getElementById("btn-send").onclick = sendText;
 document.getElementById("btn-cancel").onclick = () => {
@@ -489,6 +875,7 @@ document.getElementById("input").onkeydown = (e) => {
 });
 
 connect();
+loadRefs();
 </script>
 </body>
 </html>"""
@@ -502,6 +889,7 @@ def main():
     parser.add_argument("model_dir", help="Path to directory containing model GGUF files")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=8765, help="Port")
+    parser.add_argument("--refs-dir", default="refs", help="Directory for persistent reference audio")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -519,16 +907,27 @@ def main():
     logger.info("Models loaded in %.2fs", time.time() - t0)
     logger.info("Capabilities: %s", tts.capabilities)
 
-    # Clean up ggml resources before Python's exit() triggers static destructors
     atexit.register(tts.close)
 
-    app = web.Application()
+    refs_dir = Path(args.refs_dir).resolve()
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Reference audio directory: %s", refs_dir)
 
+    app = web.Application()
+    app["refs_dir"] = refs_dir
+
+    # HTTP API routes
+    app.router.add_get("/api/refs", handle_list_refs)
+    app.router.add_get("/api/refs/{name}", handle_get_ref)
+    app.router.add_post("/api/refs", handle_upload_ref)
+    app.router.add_delete("/api/refs/{name}", handle_delete_ref)
+
+    # WebSocket + index page
     async def ws_or_index(request):
         if request.headers.get("upgrade", "").lower() == "websocket":
             ws = web.WebSocketResponse()
             await ws.prepare(request)
-            await handler(ws, tts)
+            await ws_handler(ws, tts, refs_dir)
             return ws
         return web.Response(
             content_type="text/html",

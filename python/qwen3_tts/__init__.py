@@ -152,7 +152,7 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
     lib.qwen3_tts_synthesize.argtypes = [_void_ptr, _char_ptr, _TtsParams]
 
     lib.qwen3_tts_synthesize_with_voice.restype = _TtsResult
-    lib.qwen3_tts_synthesize_with_voice.argtypes = [_void_ptr, _char_ptr, _char_ptr, _TtsParams]
+    lib.qwen3_tts_synthesize_with_voice.argtypes = [_void_ptr, _char_ptr, _char_ptr, _char_ptr, _TtsParams]
 
     lib.qwen3_tts_synthesize_with_speaker_embedding.restype = _TtsResult
     lib.qwen3_tts_synthesize_with_speaker_embedding.argtypes = [_void_ptr, _char_ptr, _char_ptr, _TtsParams]
@@ -165,7 +165,7 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
 
     lib.qwen3_tts_synthesize_with_voice_streaming.restype = _TtsResult
     lib.qwen3_tts_synthesize_with_voice_streaming.argtypes = [
-        _void_ptr, _char_ptr, _char_ptr, _TtsStreamingParams,
+        _void_ptr, _char_ptr, _char_ptr, _char_ptr, _TtsStreamingParams,
         _AudioChunkCallback, _void_ptr,
     ]
 
@@ -354,11 +354,13 @@ class Qwen3TTS:
         return self._result_to_numpy(res)
 
     def synthesize_with_voice(self, text: str, reference_audio: Union[str, Path],
+                              reference_text: Optional[str] = None,
                               **params) -> tuple:
         """Synthesize speech with voice cloning from a reference audio file."""
         p = self._build_params(**params)
         ref = str(reference_audio).encode("utf-8")
-        res = self._lib.qwen3_tts_synthesize_with_voice(self._ctx, text.encode("utf-8"), ref, p)
+        ref_text = reference_text.encode("utf-8") if reference_text else None
+        res = self._lib.qwen3_tts_synthesize_with_voice(self._ctx, text.encode("utf-8"), ref, ref_text, p)
         return self._result_to_numpy(res)
 
     def synthesize_with_speaker_embedding(self, text: str,
@@ -388,7 +390,9 @@ class Qwen3TTS:
         """
         return self._streaming_impl(
             self._lib.qwen3_tts_synthesize_streaming,
-            text, on_audio_chunk, None, params,
+            text, on_audio_chunk,
+            extra_args=(),
+            params=params,
         )
 
     def synthesize_with_voice_streaming(
@@ -396,12 +400,15 @@ class Qwen3TTS:
         text: str,
         reference_audio: Union[str, Path],
         on_audio_chunk: Callable[[np.ndarray, int], bool],
+        reference_text: Optional[str] = None,
         **params,
     ) -> tuple:
         """Streaming synthesis with voice cloning."""
         return self._streaming_impl(
             self._lib.qwen3_tts_synthesize_with_voice_streaming,
-            text, on_audio_chunk, str(reference_audio), params,
+            text, on_audio_chunk,
+            extra_args=(str(reference_audio), reference_text),
+            params=params,
         )
 
     def synthesize_with_speaker_embedding_streaming(
@@ -414,14 +421,16 @@ class Qwen3TTS:
         """Streaming synthesis with a precomputed speaker embedding."""
         return self._streaming_impl(
             self._lib.qwen3_tts_synthesize_with_speaker_embedding_streaming,
-            text, on_audio_chunk, str(speaker_embedding_file), params,
+            text, on_audio_chunk,
+            extra_args=(str(speaker_embedding_file),),
+            params=params,
         )
 
-    def _streaming_impl(self, c_api_func, text, on_audio_chunk, extra_arg, params):
+    def _streaming_impl(self, c_api_func, text, on_audio_chunk,
+                        extra_args=(), params=None):
         """Common streaming path: set up C callback and call the C API."""
-        sp = self._build_streaming_params(**params)
+        sp = self._build_streaming_params(**(params or {}))
 
-        # The ctypes callback must outlive the C call, so we keep a reference.
         abort_flag = [False]
 
         @_AudioChunkCallback
@@ -445,12 +454,19 @@ class Qwen3TTS:
             return 1
 
         text_enc = text.encode("utf-8")
-        if extra_arg is not None:
-            extra_enc = extra_arg.encode("utf-8")
-            res = c_api_func(self._ctx, text_enc, extra_enc, sp, _c_callback, None)
-        else:
-            res = c_api_func(self._ctx, text_enc, sp, _c_callback, None)
 
+        # Build positional args for the C function call
+        c_args = [self._ctx, text_enc]
+        for a in extra_args:
+            if a is None:
+                c_args.append(None)
+            elif isinstance(a, str):
+                c_args.append(a.encode("utf-8"))
+            else:
+                c_args.append(a)
+        c_args.extend([sp, _c_callback, None])
+
+        res = c_api_func(*c_args)
         return self._result_to_numpy(res)
 
     # ── utility ─────────────────────────────────────────────────────────
