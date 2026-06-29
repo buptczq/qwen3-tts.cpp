@@ -51,6 +51,7 @@ if(QWEN3_TTS_EMBED_GGML)
     endif()
     set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     if(MSVC)
         set(MATH_LIBRARY "" CACHE STRING "MSVC does not need libm" FORCE)
     endif()
@@ -173,8 +174,8 @@ target_include_directories(audio_tokenizer_decoder PUBLIC
 qwen3_link_ggml(audio_tokenizer_decoder)
 target_link_libraries(audio_tokenizer_decoder PUBLIC Threads::Threads)
 
-# Qwen3 TTS library (full pipeline)
-add_library(qwen3_tts STATIC
+# Qwen3 TTS shared library (full pipeline, ggml statically linked)
+add_library(qwen3_tts SHARED
     src/common/audio_io.cpp
     src/common/speaker_embedding_io.cpp
     src/pipeline/pipeline_models.cpp
@@ -195,6 +196,7 @@ target_link_libraries(qwen3_tts PUBLIC
     audio_tokenizer_decoder
     Threads::Threads
 )
+qwen3_link_ggml(qwen3_tts)
 target_compile_definitions(qwen3_tts PRIVATE QWEN3_TTS_EXPORT)
 if(WIN32)
     target_link_libraries(qwen3_tts PUBLIC Psapi)
@@ -275,6 +277,7 @@ target_link_libraries(test_decoder PRIVATE
 # Install targets
 install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder speech_tokenizer_encoder audio_tokenizer_decoder qwen3_tts qwen3-tts-cli
     ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
 install(FILES 
