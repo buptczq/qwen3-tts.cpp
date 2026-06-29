@@ -173,11 +173,16 @@ class ClientSession:
                     "request_id": req.id,
                     "text": req.text,
                 })
-                await self._synthesize(req)
+                wav_b64 = await self._synthesize(req)
                 if req.cancelled:
                     await self._send({"type": "cancelled", "request_id": req.id})
                 else:
-                    await self._send({"type": "done", "request_id": req.id})
+                    await self._send({
+                        "type": "done",
+                        "request_id": req.id,
+                        "wav_base64": wav_b64,
+                        "sample_rate": SAMPLE_RATE,
+                    })
             except Exception as e:
                 logger.exception("synthesis failed")
                 try:
@@ -531,6 +536,9 @@ let gainNode = null;
 let mediaRecorder = null;
 let recordingChunks = [];
 let selectedRef = "";
+// PCM cache per request: reqId -> { b64chunks: string[], sampleRate, text }
+let pcmCache = {};
+let pcmCacheOrder = [];
 
 function connect() {
   ws = new WebSocket(wsUrl);
@@ -564,48 +572,128 @@ function handleMsg(msg) {
       break;
     case "start":
       currentReqId = msg.request_id;
+      pcmCache[currentReqId] = { b64chunks: [], sampleRate: 0, text: msg.text || "" };
+      pcmCacheOrder.push(currentReqId);
       addSystemMsg("开始合成: " + (msg.text || ""));
       break;
-    case "audio":
+    case "audio": {
       if (msg.request_id && msg.request_id !== currentReqId) break;
-      playAudio(msg.data, msg.sample_rate || 24000);
+      const sr = msg.sample_rate || 24000;
+      const float32 = decodePcm16B64(msg.data);
+      playFloat32(float32, sr);
+      const rid = msg.request_id || currentReqId;
+      if (rid && pcmCache[rid]) {
+        pcmCache[rid].b64chunks.push(msg.data);
+        pcmCache[rid].sampleRate = sr;
+      }
       break;
+    }
     case "done":
-      addSystemMsg("合成完成");
-      currentReqId = null;
+      addDoneWithDownload(msg.request_id || currentReqId);
+      if (msg.request_id === currentReqId || !msg.request_id) currentReqId = null;
       break;
     case "cancelled":
       addSystemMsg("已取消", true);
+      if (currentReqId && pcmCache[currentReqId]) delete pcmCache[currentReqId];
       currentReqId = null;
       break;
     case "error":
       addSystemMsg("错误: " + msg.message, true);
+      if (currentReqId && pcmCache[currentReqId]) delete pcmCache[currentReqId];
       currentReqId = null;
       break;
   }
 }
 
-function playAudio(b64data, sampleRate) {
+function decodePcm16B64(b64data) {
   const pcm = base64ToBytes(b64data);
-  const int16 = new Int16Array(pcm.buffer);
-  const float32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) {
-    float32[i] = int16[i] / 32768;
+  const n = Math.floor(pcm.length / 2);
+  const view = new DataView(pcm.buffer, pcm.byteOffset, n * 2);
+  const float32 = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    float32[i] = view.getInt16(i * 2, true) / 32768;
   }
+  return float32;
+}
 
+function playFloat32(float32, sampleRate) {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
     gainNode = audioCtx.createGain();
     gainNode.gain.value = 1.0;
     gainNode.connect(audioCtx.destination);
   }
-
   const buf = audioCtx.createBuffer(1, float32.length, sampleRate);
   buf.getChannelData(0).set(float32);
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
   src.connect(gainNode);
   src.start();
+}
+
+function addDoneWithDownload(reqId) {
+  const chat = document.getElementById("chat");
+  const div = document.createElement("div");
+  div.className = "msg system";
+  const time = new Date().toLocaleTimeString();
+  const c = reqId ? pcmCache[reqId] : null;
+  if (c && c.b64chunks.length > 0) {
+    const chunks = c.b64chunks.map(b => decodePcm16B64(b));
+    const total = chunks.reduce((s, a) => s + a.length, 0);
+    const dur = (total / c.sampleRate).toFixed(2);
+    const wav = encodeWav(chunks, c.sampleRate);
+    const blob = new Blob([wav], { type: "audio/wav" });
+    const url = URL.createObjectURL(blob);
+    const safeName = (c.text || "tts").substring(0, 30).replace(/[^\w\u4e00-\u9fff]/g, "_") || "tts";
+    div.innerHTML = `<div>合成完成 (${dur}s) — <a href="${url}" download="${safeName}.wav">下载 WAV</a></div><div class="meta">${time}</div>`;
+    prunePcmCache(10);
+  } else {
+    div.innerHTML = `<div>合成完成</div><div class="meta">${time}</div>`;
+    if (reqId && pcmCache[reqId]) delete pcmCache[reqId];
+  }
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function prunePcmCache(maxKeep) {
+  while (pcmCacheOrder.length > maxKeep) {
+    const old = pcmCacheOrder.shift();
+    delete pcmCache[old];
+  }
+}
+
+function encodeWav(float32Chunks, sampleRate) {
+  const total = float32Chunks.reduce((s, a) => s + a.length, 0);
+  const buf = new ArrayBuffer(44 + total * 2);
+  const view = new DataView(buf);
+  // RIFF header
+  writeStr(view, 0, "RIFF");
+  view.setUint32(4, 36 + total * 2, true);
+  writeStr(view, 8, "WAVE");
+  // fmt chunk
+  writeStr(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);        // PCM
+  view.setUint16(22, 1, true);        // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true);        // block align
+  view.setUint16(34, 16, true);       // bits per sample
+  // data chunk
+  writeStr(view, 36, "data");
+  view.setUint32(40, total * 2, true);
+  let off = 44;
+  for (const chunk of float32Chunks) {
+    for (let i = 0; i < chunk.length; i++, off += 2) {
+      let s = Math.max(-1, Math.min(1, chunk[i]));
+      view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+  }
+  return buf;
+}
+
+function writeStr(view, off, str) {
+  for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
 }
 
 function base64ToBytes(b64) {
@@ -801,7 +889,7 @@ document.getElementById("up-record").onclick = async () => {
           const ch = decoded.getChannelData(i);
           for (let s = 0; s < length; s++) mono[s] += ch[s] / numChannels;
         }
-        const wav = encodeWav(mono, sr);
+        const wav = encodeWavMono(mono, sr);
         const wavFile = new File([wav], "recording.wav", { type: "audio/wav" });
         const dt = new DataTransfer();
         dt.items.add(wavFile);
@@ -821,7 +909,7 @@ document.getElementById("up-record").onclick = async () => {
   }
 };
 
-function encodeWav(samples, sampleRate) {
+function encodeWavMono(samples, sampleRate) {
   const len = samples.length;
   const dataLen = len * 2;
   const buf = new ArrayBuffer(44 + dataLen);
