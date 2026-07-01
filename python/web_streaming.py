@@ -19,12 +19,19 @@ Client -> Server (JSON):
   {"type": "cancel"}                                — cancel current synthesis
 
 Server -> Client (JSON lines):
-  {"type": "queued",    "position": N}
-  {"type": "start",     "request_id": "...", "text": "..."}
-  {"type": "audio",     "data": "<base64 PCM16>", "sample_rate": 24000}
-  {"type": "done",      "request_id": "..."}
-  {"type": "cancelled", "request_id": "..."}
-  {"type": "error",     "message": "..."}
+  {"type": "queued",       "position": N}
+  {"type": "start",        "request_id": "...", "text": "..."}
+  {"type": "audio",        "data": "<base64 PCM16>", "sample_rate": 24000}
+  {"type": "sentence_end", "request_id": "...", "text": "..."}
+  {"type": "done",         "request_id": "...", "sample_rate": 24000}
+  {"type": "cancelled",    "request_id": "..."}
+  {"type": "error",        "message": "..."}
+
+Text is split into sentences server-side. All sentences are synthesized
+sequentially in a single background thread using a shared queue. Audio chunks
+are pushed to the client immediately as they arrive. After each sentence
+finishes, a ``sentence_end`` marker is emitted. Because the thread immediately
+starts the next sentence, there is no gap between sentences.
 """
 
 import argparse
@@ -52,6 +59,32 @@ from qwen3_tts import Qwen3TTS
 logger = logging.getLogger("web_streaming")
 
 SAMPLE_RATE = 24000
+
+# ── sentence splitting ────────────────────────────────────────────────────────
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split text into segments at pause-inducing punctuation.
+
+    Splits on sentence-ending punctuation (.!?。！？\n) AND pause-inducing
+    punctuation (,，、;；:：). This gives the client finer-grained
+    ``sentence_end`` markers for smoother buffered playback.
+    """
+    sentences = []
+    current = []
+    for ch in text:
+        current.append(ch)
+        if ch in ".!?。！？\n,，、;；:：" and current:
+            s = "".join(current).strip()
+            if s:
+                sentences.append(s)
+            current = []
+    if current:
+        s = "".join(current).strip()
+        if s:
+            sentences.append(s)
+    return sentences if sentences else [text]
+
 
 # ── reference audio persistence ─────────────────────────────────────────────
 
@@ -185,6 +218,7 @@ class Request:
 
 
 _CHUNK_END = None
+_SENTENCE_END = "__SENTENCE_END__"
 
 
 class ClientSession:
@@ -233,14 +267,13 @@ class ClientSession:
                     "request_id": req.id,
                     "text": req.text,
                 })
-                wav_b64 = await self._synthesize(req)
+                await self._synthesize(req)
                 if req.cancelled:
                     await self._send({"type": "cancelled", "request_id": req.id})
                 else:
                     await self._send({
                         "type": "done",
                         "request_id": req.id,
-                        "wav_base64": wav_b64,
                         "sample_rate": SAMPLE_RATE,
                     })
             except Exception as e:
@@ -256,7 +289,14 @@ class ClientSession:
                 self._current = None
 
     async def _synthesize(self, req: Request):
-        """Run streaming synthesis in a thread, sending PCM16 chunks via WebSocket."""
+        """Run streaming synthesis sentence by sentence, pushing chunks in real-time.
+
+        All sentences are processed sequentially in a single background thread
+        using a shared queue. Audio chunks are pushed to the client immediately
+        as they arrive from the C++ engine. After each sentence finishes, a
+        ``sentence_end`` marker is emitted. Because the thread immediately starts
+        the next sentence, there is no gap between sentences.
+        """
         params = {
             "temperature": 0.7,
             "n_threads": 4,
@@ -281,41 +321,61 @@ class ClientSession:
                 ref_samples = wav_to_pcm(wav_bytes)
                 ref_text = ref_data.get("reference_text") or None
 
+        # Split text into sentences
+        sentences = split_sentences(req.text)
+        if not sentences:
+            sentences = [req.text]
+
         chunk_queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
 
         def _run():
-            def _on_chunk(samples: np.ndarray, sr: int) -> bool:
+            """Background thread: synthesize sentences sequentially, push chunks
+            and sentence-end sentinels into the shared queue."""
+            for sentence in sentences:
                 if self._cancel_event.is_set():
-                    return False
-                fut = asyncio.run_coroutine_threadsafe(
-                    chunk_queue.put(samples), loop
-                )
-                fut.result(timeout=10)
-                return True
+                    break
 
-            try:
-                if ref_samples is not None:
-                    self._tts.synthesize_with_voice_streaming_from_pcm(
-                        req.text, ref_samples,
-                        on_audio_chunk=_on_chunk,
-                        reference_text=ref_text,
-                        **params,
+                def _on_chunk(samples: np.ndarray, sr: int) -> bool:
+                    if self._cancel_event.is_set():
+                        return False
+                    fut = asyncio.run_coroutine_threadsafe(
+                        chunk_queue.put(samples), loop
                     )
-                else:
-                    self._tts.synthesize_streaming(
-                        req.text, on_audio_chunk=_on_chunk, **params,
-                    )
-            except Exception as e:
+                    fut.result(timeout=10)
+                    return True
+
+                try:
+                    if ref_samples is not None:
+                        self._tts.synthesize_with_voice_streaming_from_pcm(
+                            sentence, ref_samples,
+                            on_audio_chunk=_on_chunk,
+                            reference_text=ref_text,
+                            **params,
+                        )
+                    else:
+                        self._tts.synthesize_streaming(
+                            sentence, on_audio_chunk=_on_chunk, **params,
+                        )
+                except Exception as e:
+                    asyncio.run_coroutine_threadsafe(
+                        chunk_queue.put(e), loop
+                    ).result()
+                    return
+
+                # Signal that this sentence is complete
                 asyncio.run_coroutine_threadsafe(
-                    chunk_queue.put(e), loop
-                ).result()
-            finally:
-                asyncio.run_coroutine_threadsafe(
-                    chunk_queue.put(_CHUNK_END), loop
+                    chunk_queue.put(_SENTENCE_END), loop
                 ).result()
 
-        loop = asyncio.get_running_loop()
+            # Signal end of all sentences
+            asyncio.run_coroutine_threadsafe(
+                chunk_queue.put(_CHUNK_END), loop
+            ).result()
+
         thread_task = loop.run_in_executor(None, _run)
+
+        sentence_idx = 0
 
         while True:
             item = await chunk_queue.get()
@@ -325,12 +385,24 @@ class ClientSession:
                 raise item
             if req.cancelled:
                 break
+
+            if item is _SENTENCE_END:
+                await self._send({
+                    "type": "sentence_end",
+                    "request_id": req.id,
+                    "text": sentences[sentence_idx],
+                })
+                sentence_idx += 1
+                continue
+
+            # Regular audio chunk
             pcm = pcm16_encode(item)
             b64 = base64.b64encode(pcm).decode("ascii")
             await self._send({
                 "type": "audio",
                 "data": b64,
                 "sample_rate": SAMPLE_RATE,
+                "request_id": req.id,
             })
 
         await thread_task
@@ -592,6 +664,13 @@ let selectedRef = "";
 let pcmCache = {};
 let pcmCacheOrder = [];
 
+// Sentence-buffered playback state
+let sentenceBuffer = [];       // Float32Array chunks for current sentence
+let playbackMode = 'realtime'; // 'realtime' | 'buffered'
+let nextPlayTime = 0;          // AudioContext time for next scheduled playback
+let lastChunkTime = 0;         // Timestamp of last received audio chunk
+let sentenceCount = 0;
+
 function connect() {
   ws = new WebSocket(wsUrl);
   const bar = document.getElementById("connect-bar");
@@ -626,33 +705,72 @@ function handleMsg(msg) {
       currentReqId = msg.request_id;
       pcmCache[currentReqId] = { b64chunks: [], sampleRate: 0, text: msg.text || "" };
       pcmCacheOrder.push(currentReqId);
+      sentenceBuffer = [];
+      playbackMode = 'realtime';
+      lastChunkTime = 0;
+      sentenceCount = 0;
       addSystemMsg("开始合成: " + (msg.text || ""));
       break;
     case "audio": {
       if (msg.request_id && msg.request_id !== currentReqId) break;
       const sr = msg.sample_rate || 24000;
       const float32 = decodePcm16B64(msg.data);
-      playFloat32(float32, sr);
+      const dur = float32.length / sr;
+
+      // Cache for download
       const rid = msg.request_id || currentReqId;
       if (rid && pcmCache[rid]) {
         pcmCache[rid].b64chunks.push(msg.data);
         pcmCache[rid].sampleRate = sr;
+      }
+
+      // Detect stuttering: if chunk arrives slower than real-time
+      const now = Date.now();
+      if (lastChunkTime > 0 && playbackMode === 'realtime') {
+        const gapSec = (now - lastChunkTime) / 1000;
+        if (gapSec > dur * 1.5) {
+          // Chunk arrived slower than its duration -> falling behind
+          playbackMode = 'buffered';
+        }
+      }
+      lastChunkTime = now;
+
+      if (playbackMode === 'realtime') {
+        playFloat32(float32, sr);
+      } else {
+        sentenceBuffer.push(float32);
+      }
+      break;
+    }
+    case "sentence_end": {
+      sentenceCount++;
+      // If in buffered mode, play the complete sentence now
+      if (playbackMode === 'buffered' && sentenceBuffer.length > 0) {
+        playBufferedSentence(sentenceBuffer, 24000);
+      }
+      sentenceBuffer = [];
+      // After a sentence completes without stuttering, switch back to realtime
+      if (playbackMode === 'buffered') {
+        playbackMode = 'realtime';
       }
       break;
     }
     case "done":
       addDoneWithDownload(msg.request_id || currentReqId);
       if (msg.request_id === currentReqId || !msg.request_id) currentReqId = null;
+      sentenceBuffer = [];
       break;
     case "cancelled":
       addSystemMsg("已取消", true);
       if (currentReqId && pcmCache[currentReqId]) delete pcmCache[currentReqId];
       currentReqId = null;
+      sentenceBuffer = [];
       break;
     case "error":
       addSystemMsg("错误: " + msg.message, true);
       if (currentReqId && pcmCache[currentReqId]) delete pcmCache[currentReqId];
       currentReqId = null;
+      sentenceBuffer = [];
       break;
   }
 }
@@ -681,6 +799,35 @@ function playFloat32(float32, sampleRate) {
   src.buffer = buf;
   src.connect(gainNode);
   src.start();
+  // Track end time for smooth transition to buffered mode
+  nextPlayTime = Math.max(nextPlayTime, audioCtx.currentTime + float32.length / sampleRate);
+}
+
+function playBufferedSentence(chunks, sampleRate) {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = 1.0;
+    gainNode.connect(audioCtx.destination);
+  }
+  // Concatenate all chunks into one buffer
+  const totalLen = chunks.reduce((s, a) => s + a.length, 0);
+  const combined = new Float32Array(totalLen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  // Schedule playback to start after the previous audio finishes
+  const buf = audioCtx.createBuffer(1, combined.length, sampleRate);
+  buf.getChannelData(0).set(combined);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(gainNode);
+  const now = audioCtx.currentTime;
+  const when = Math.max(now, nextPlayTime);
+  src.start(when);
+  nextPlayTime = when + combined.length / sampleRate;
 }
 
 function addDoneWithDownload(reqId) {
