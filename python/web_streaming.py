@@ -975,7 +975,7 @@ loadRefs();
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-TTS WebSocket streaming server")
     parser.add_argument("model_dir", help="Path to directory containing model GGUF files")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     parser.add_argument("--port", type=int, default=8765, help="Port")
     parser.add_argument("--refs-dir", default="refs", help="Directory for persistent reference audio")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

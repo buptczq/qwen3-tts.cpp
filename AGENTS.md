@@ -179,6 +179,40 @@ git diff --exit-code -- reference/det_metadata.json reference/metadata.json
 # (equivalent pathspec form: git diff --exit-code -- reference/*.json)
 ```
 
+## WebSocket Streaming Server
+
+Start the browser-based TTS demo with WebSocket streaming:
+
+```bash
+uv run python/web_streaming.py models --port 8765 --refs-dir refs
+```
+
+Optional dependencies (`aiohttp`) are declared under `[project.optional-dependencies] web` in `pyproject.toml`.
+
+### Testing with the WebSocket Client
+
+A command-line test client is available at `python/web_streaming_client.py`. It can connect to the server, send synthesis requests, and save the received audio.
+
+```bash
+# List saved references
+uv run python/web_streaming_client.py --list-refs
+
+# Basic synthesis (saves to output.wav)
+uv run python/web_streaming_client.py --text "Hello, world!" -o hello.wav
+
+# Greedy decoding with short output
+uv run python/web_streaming_client.py --text "Hello" --temperature 0 --max-tokens 64 -o out.wav
+
+# With a saved reference
+uv run python/web_streaming_client.py --text "Hello" --ref-name my_voice -o out.wav
+
+# Upload a reference
+uv run python/web_streaming_client.py --upload-ref ref.wav --ref-name my_voice --ref-text "transcript"
+
+# Custom server address
+uv run python/web_streaming_client.py --host 127.0.0.1 --port 8765 --text "Hi" -o hi.wav
+```
+
 ## Git Conventions
 
 - Conventional commits: `feat(scope):`, `fix(scope):`, `docs:`
