@@ -175,14 +175,6 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
         _AudioChunkCallback, _void_ptr,
     ]
 
-    lib.qwen3_tts_synthesize_with_voice_streaming_from_pcm.restype = _TtsResult
-    lib.qwen3_tts_synthesize_with_voice_streaming_from_pcm.argtypes = [
-        _void_ptr, _char_ptr,
-        ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
-        _char_ptr, _TtsStreamingParams,
-        _AudioChunkCallback, _void_ptr,
-    ]
-
     lib.qwen3_tts_extract_speaker_embedding.restype = _int32
     lib.qwen3_tts_extract_speaker_embedding.argtypes = [_void_ptr, _char_ptr, _char_ptr]
 
@@ -416,43 +408,6 @@ class Qwen3TTS:
             self._lib.qwen3_tts_synthesize_with_voice_streaming,
             text, on_audio_chunk,
             extra_args=(str(reference_audio), reference_text),
-            params=params,
-        )
-
-    def synthesize_with_voice_streaming_from_pcm(
-        self,
-        text: str,
-        ref_samples: np.ndarray,
-        on_audio_chunk: Callable[[np.ndarray, int], bool],
-        reference_text: Optional[str] = None,
-        **params,
-    ) -> tuple:
-        """Streaming synthesis with voice cloning from raw PCM samples.
-
-        Parameters
-        ----------
-        text : str
-            Text to synthesize.
-        ref_samples : np.ndarray
-            Reference audio samples as float32 array normalized to [-1, 1],
-            24 kHz mono.
-        on_audio_chunk : Callable[[np.ndarray, int], bool]
-            Called for each decoded audio chunk. Return True to continue
-            or False to abort.
-        reference_text : str, optional
-            Transcript of the reference audio for ICL voice cloning.
-
-        Returns
-        -------
-        (success, audio, sample_rate, error_msg, t_total_ms)
-        """
-        samples = np.asarray(ref_samples, dtype=np.float32).ravel()
-        n = ctypes.c_int32(len(samples))
-        ptr = samples.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        return self._streaming_impl(
-            self._lib.qwen3_tts_synthesize_with_voice_streaming_from_pcm,
-            text, on_audio_chunk,
-            extra_args=(ptr, n, reference_text),
             params=params,
         )
 
