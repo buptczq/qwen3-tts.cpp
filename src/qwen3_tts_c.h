@@ -123,6 +123,17 @@ QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_synthesize_with_voice_streaming(
     void* user_data
 );
 
+QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_synthesize_with_voice_streaming_from_pcm(
+    qwen3_tts_context_t* ctx,
+    const char* text,
+    const float* ref_samples,
+    int32_t n_ref_samples,
+    const char* reference_text,
+    qwen3_tts_streaming_params_t params,
+    qwen3_tts_audio_chunk_callback callback,
+    void* user_data
+);
+
 QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_synthesize_with_speaker_embedding_streaming(
     qwen3_tts_context_t* ctx,
     const char* text,

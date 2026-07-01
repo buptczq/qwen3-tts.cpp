@@ -113,6 +113,66 @@ def pcm16_encode(samples: np.ndarray) -> bytes:
     return (clipped * 32767).astype(np.int16).tobytes()
 
 
+def wav_to_pcm(wav_bytes: bytes) -> np.ndarray:
+    """Decode WAV bytes to float32 PCM samples normalized to [-1, 1].
+
+    Supports mono/stereo 16-bit WAV. Multi-channel audio is averaged to mono.
+    """
+    import struct
+
+    if wav_bytes[:4] != b"RIFF" or wav_bytes[8:12] != b"WAVE":
+        raise ValueError("Not a valid WAV file")
+
+    # Parse chunks
+    pos = 12
+    sample_rate = 24000
+    bits_per_sample = 16
+    channels = 1
+    data = None
+
+    while pos + 8 <= len(wav_bytes):
+        chunk_id = wav_bytes[pos:pos+4]
+        chunk_size = struct.unpack_from("<I", wav_bytes, pos + 4)[0]
+        pos += 8
+        if chunk_id == b"fmt ":
+            fmt_data = wav_bytes[pos:pos+chunk_size]
+            audio_format = struct.unpack_from("<H", fmt_data, 0)[0]
+            channels = struct.unpack_from("<H", fmt_data, 2)[0]
+            sample_rate = struct.unpack_from("<I", fmt_data, 4)[0]
+            bits_per_sample = struct.unpack_from("<H", fmt_data, 14)[0]
+            if audio_format != 1:  # PCM
+                raise ValueError(f"Unsupported WAV format: {audio_format}")
+        elif chunk_id == b"data":
+            data = wav_bytes[pos:pos+chunk_size]
+            break
+        pos += chunk_size
+
+    if data is None:
+        raise ValueError("No data chunk found in WAV")
+
+    # Convert to float32
+    if bits_per_sample == 16:
+        raw = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+    elif bits_per_sample == 32:
+        raw = np.frombuffer(data, dtype=np.int32).astype(np.float32)
+    elif bits_per_sample == 8:
+        raw = np.frombuffer(data, dtype=np.uint8).astype(np.float32) - 128.0
+    else:
+        raise ValueError(f"Unsupported bit depth: {bits_per_sample}")
+
+    # Normalize to [-1, 1]
+    if bits_per_sample == 32:
+        raw /= 2147483648.0
+    else:
+        raw /= 32768.0
+
+    # Average channels to mono
+    if channels > 1:
+        raw = raw.reshape(-1, channels).mean(axis=1)
+
+    return raw
+
+
 # ── per-client session ──────────────────────────────────────────────────────
 
 @dataclass
@@ -210,18 +270,15 @@ class ClientSession:
 
         # Resolve reference audio from persisted refs
         ref_name = params.pop("ref_name", None)
-        ref_path: Optional[str] = None
+        ref_samples: Optional[np.ndarray] = None
         ref_text: Optional[str] = None
         if ref_name:
             ref_data = _get_ref_full(self._refs_dir, ref_name)
             if ref_data is None:
                 logger.warning("ref_name '%s' not found, falling back to no voice clone", ref_name)
             else:
-                # Decode wav to a temp file for the C API
                 wav_bytes = base64.b64decode(ref_data["wav_base64"])
-                tmp_path = self._refs_dir / f"_{uuid.uuid4().hex}.wav"
-                tmp_path.write_bytes(wav_bytes)
-                ref_path = str(tmp_path)
+                ref_samples = wav_to_pcm(wav_bytes)
                 ref_text = ref_data.get("reference_text") or None
 
         chunk_queue: asyncio.Queue = asyncio.Queue()
@@ -237,9 +294,9 @@ class ClientSession:
                 return True
 
             try:
-                if ref_path:
-                    self._tts.synthesize_with_voice_streaming(
-                        req.text, ref_path,
+                if ref_samples is not None:
+                    self._tts.synthesize_with_voice_streaming_from_pcm(
+                        req.text, ref_samples,
                         on_audio_chunk=_on_chunk,
                         reference_text=ref_text,
                         **params,
@@ -253,11 +310,6 @@ class ClientSession:
                     chunk_queue.put(e), loop
                 ).result()
             finally:
-                if ref_path:
-                    try:
-                        Path(ref_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
                 asyncio.run_coroutine_threadsafe(
                     chunk_queue.put(_CHUNK_END), loop
                 ).result()
