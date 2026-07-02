@@ -5,6 +5,7 @@
 #include "audio_tokenizer_encoder.h"
 #include "speech_tokenizer_encoder.h"
 #include "audio_tokenizer_decoder.h"
+#include "asr_pipeline.h"
 
 #include <string>
 #include <vector>
@@ -227,6 +228,24 @@ public:
 
     // Return feature flags for the currently loaded model.
     tts_model_capabilities get_model_capabilities() const;
+
+    // --- ASR / VAD ---
+
+    // Transcribe audio file using SenseVoice or Paraformer.
+    // audio_path: path to WAV file (any sample rate, will be resampled to 16kHz)
+    // model_gguf: path to the ASR model GGUF file
+    // params: ASR parameters (VAD, threading, output format)
+    asr_result transcribe(const std::string& audio_path,
+                          const std::string& model_gguf,
+                          const asr_params& params);
+
+    // Detect speech segments using FSMN-VAD.
+    // audio_path: path to WAV file
+    // vad_gguf: path to the VAD model GGUF file
+    bool detect_vad(const std::string& audio_path,
+                    const std::string& vad_gguf,
+                    std::vector<vad_segment>& segments,
+                    int maxseg_ms = 30000);
     
 private:
     friend struct pipeline_internal::ops;

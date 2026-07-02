@@ -174,6 +174,39 @@ target_include_directories(audio_tokenizer_decoder PUBLIC
 qwen3_link_ggml(audio_tokenizer_decoder)
 target_link_libraries(audio_tokenizer_decoder PUBLIC Threads::Threads)
 
+# FSMN-VAD library (ASR voice activity detection)
+add_library(fsmn_vad STATIC
+    src/asr_vad_impl.cpp
+)
+target_include_directories(fsmn_vad PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+qwen3_link_ggml(fsmn_vad)
+target_link_libraries(fsmn_vad PUBLIC Threads::Threads)
+
+# SenseVoice ASR library
+add_library(sensevoice_asr STATIC
+    src/asr_sensevoice_impl.cpp
+)
+target_include_directories(sensevoice_asr PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+qwen3_link_ggml(sensevoice_asr)
+target_link_libraries(sensevoice_asr PUBLIC Threads::Threads)
+
+# Paraformer ASR library
+add_library(paraformer_asr STATIC
+    src/asr_paraformer_impl.cpp
+)
+target_include_directories(paraformer_asr PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+qwen3_link_ggml(paraformer_asr)
+target_link_libraries(paraformer_asr PUBLIC Threads::Threads)
+
 # Qwen3 TTS shared library (full pipeline, ggml statically linked)
 add_library(qwen3_tts SHARED
     src/common/audio_io.cpp
@@ -183,6 +216,7 @@ add_library(qwen3_tts SHARED
     src/pipeline/pipeline_synthesize.cpp
     src/qwen3_tts.cpp
     src/qwen3_tts_c.cpp
+    src/asr_pipeline.cpp
 )
 target_include_directories(qwen3_tts PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -194,6 +228,9 @@ target_link_libraries(qwen3_tts PUBLIC
     audio_tokenizer_encoder
     speech_tokenizer_encoder
     audio_tokenizer_decoder
+    fsmn_vad
+    sensevoice_asr
+    paraformer_asr
     Threads::Threads
 )
 qwen3_link_ggml(qwen3_tts)
@@ -275,19 +312,23 @@ target_link_libraries(test_decoder PRIVATE
 )
 
 # Install targets
-install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder speech_tokenizer_encoder audio_tokenizer_decoder qwen3_tts qwen3-tts-cli
+install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder speech_tokenizer_encoder audio_tokenizer_decoder fsmn_vad sensevoice_asr paraformer_asr qwen3_tts qwen3-tts-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
-install(FILES 
-    src/gguf_loader.h 
-    src/text_tokenizer.h 
-    src/tts_transformer.h 
+install(FILES
+    src/gguf_loader.h
+    src/text_tokenizer.h
+    src/tts_transformer.h
     src/coreml_code_predictor.h
-    src/audio_tokenizer_encoder.h 
+    src/audio_tokenizer_encoder.h
     src/speech_tokenizer_encoder.h
-    src/audio_tokenizer_decoder.h 
+    src/audio_tokenizer_decoder.h
+    src/asr_pipeline.h
+    src/funasr_vad.h
+    src/sensevoice_asr.h
+    src/paraformer_asr.h
     src/qwen3_tts.h
     DESTINATION include
 )

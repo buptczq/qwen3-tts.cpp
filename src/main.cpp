@@ -180,11 +180,11 @@ static bool load_int32_list_file(const std::string & path,
 }
 
 void print_usage(const char * program) {
-    fprintf(stderr, "Usage: %s [options] -m <model_dir> -t <text>\n", program);
+    fprintf(stderr, "Usage: %s [options]\n", program);
     fprintf(stderr, "\n");
-    fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -m, --model <dir>      Model directory (required)\n");
-    fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
+    fprintf(stderr, "TTS mode:\n");
+    fprintf(stderr, "  -m, --model <dir>      Model directory (required for TTS)\n");
+    fprintf(stderr, "  -t, --text <text>      Text to synthesize\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
     fprintf(stderr, "  --reference-text <text> Reference transcript for ICL voice cloning\n");
@@ -203,20 +203,34 @@ void print_usage(const char * program) {
     fprintf(stderr, "  --seed <n>             RNG seed for sampling (default: -1=random)\n");
     fprintf(stderr, "  --max-tokens <n>       Maximum audio tokens (default: 4096)\n");
     fprintf(stderr, "  --repeat <n>           Run synthesis n times in one process (default: 1)\n");
-    fprintf(stderr, "  --stream               Use streaming synthesis API and collect chunks for WAV output\n");
+    fprintf(stderr, "  --stream               Use streaming synthesis API\n");
     fprintf(stderr, "  --stream-chunk-sec <s> Streaming codec chunk duration (default: 1.0)\n");
     fprintf(stderr, "  --stream-left-context-sec <s> Streaming decoder left context (default: 2.0)\n");
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
     fprintf(stderr, "  -l, --language <lang>  Language: en,ru,zh,ja,ko,de,fr,es (default: en)\n");
     fprintf(stderr, "  --instruction <instr>  Style/voice instruction\n");
-    fprintf(stderr, "  --instruct <text>      Voice steering instructions (e.g. \"whispering\")\n");
+    fprintf(stderr, "  --instruct <text>      Voice steering instructions\n");
     fprintf(stderr, "  -j, --threads <n>      Number of threads (default: 4)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "ASR mode (speech recognition):\n");
+    fprintf(stderr, "  --asr                  Enable ASR mode (transcribe audio)\n");
+    fprintf(stderr, "  -a, --audio <file>     Input audio file (WAV, any sample rate)\n");
+    fprintf(stderr, "  --asr-model <file>     ASR model GGUF file (SenseVoice or Paraformer)\n");
+    fprintf(stderr, "  --vad-model <file>     FSMN-VAD model GGUF for long audio segmentation\n");
+    fprintf(stderr, "  --vad-maxseg <ms>      Max VAD segment duration (default: 30000)\n");
+    fprintf(stderr, "  --asr-ids              Output token IDs instead of text\n");
+    fprintf(stderr, "  --asr-keep-tags        Keep <|...|> meta tags in SenseVoice output\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "VAD mode (voice activity detection):\n");
+    fprintf(stderr, "  --vad-only             Detect speech segments only (no ASR)\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "  -h, --help             Show this help\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "Example:\n");
-    fprintf(stderr, "  %s -m ./models -t \"Hello, world!\" -o hello.wav\n", program);
-    fprintf(stderr, "  %s -m ./models -t \"Hello!\" -r reference.wav -o cloned.wav\n", program);
-    fprintf(stderr, "  %s -m ./models -t \"Hello!\" --speaker-embedding speaker.json -o cloned.wav\n", program);
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  TTS:  %s -m ./models -t \"Hello, world!\" -o hello.wav\n", program);
+    fprintf(stderr, "  ASR:  %s --asr -a audio.wav --asr-model sensevoice.gguf\n", program);
+    fprintf(stderr, "  ASR+VAD: %s --asr -a audio.wav --asr-model sensevoice.gguf --vad-model fsmn-vad.gguf\n", program);
+    fprintf(stderr, "  VAD:  %s --vad-only -a audio.wav --vad-model fsmn-vad.gguf\n", program);
 }
 
 int main(int argc, char ** argv) {
@@ -249,7 +263,17 @@ int main(int argc, char ** argv) {
     std::string extract_speaker_embedding_file;
     int repeat_count = 1;
     bool use_streaming = false;
-    
+
+    // ASR/VAD mode
+    bool asr_mode = false;
+    bool vad_only_mode = false;
+    std::string audio_file;
+    std::string asr_model_file;
+    std::string vad_model_file;
+    int vad_maxseg = 30000;
+    bool asr_ids = false;
+    bool asr_keep_tags = false;
+
     qwen3_tts::tts_params params;
     qwen3_tts::tts_streaming_params stream_params;
     params.print_progress = true;
@@ -439,25 +463,46 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             params.n_threads = std::stoi(args[i]);
+        } else if (arg == "--asr") {
+            asr_mode = true;
+        } else if (arg == "--vad-only") {
+            vad_only_mode = true;
+        } else if (arg == "-a" || arg == "--audio") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing audio file\n");
+                return 1;
+            }
+            audio_file = args[i];
+        } else if (arg == "--asr-model") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing ASR model file\n");
+                return 1;
+            }
+            asr_model_file = args[i];
+        } else if (arg == "--vad-model") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing VAD model file\n");
+                return 1;
+            }
+            vad_model_file = args[i];
+        } else if (arg == "--vad-maxseg") {
+            if (++i >= (int) args.size()) {
+                fprintf(stderr, "Error: missing vad-maxseg value\n");
+                return 1;
+            }
+            vad_maxseg = std::stoi(args[i]);
+        } else if (arg == "--asr-ids") {
+            asr_ids = true;
+        } else if (arg == "--asr-keep-tags") {
+            asr_keep_tags = true;
         } else {
             fprintf(stderr, "Error: unknown argument: %s\n", arg.c_str());
             print_usage(args[0].c_str());
             return 1;
         }
     }
-    
-    // Validate required arguments
-    if (model_dir.empty()) {
-        fprintf(stderr, "Error: model directory is required\n");
-        print_usage(args[0].c_str());
-        return 1;
-    }
-    
-    if (text.empty() && extract_speaker_embedding_file.empty()) {
-        fprintf(stderr, "Error: text is required\n");
-        print_usage(args[0].c_str());
-        return 1;
-    }
+
+    // Validate TTS-specific arguments (ASR/VAD modes return early above)
     if (repeat_count < 1) {
         fprintf(stderr, "Error: --repeat must be >= 1\n");
         return 1;
@@ -531,7 +576,77 @@ int main(int argc, char ** argv) {
         stream_params.generation = params;
         stream_params.collect_audio = true;
     }
-    
+
+    // --- ASR / VAD mode dispatch ---
+    if (asr_mode || vad_only_mode) {
+        if (audio_file.empty()) {
+            fprintf(stderr, "Error: --asr/--vad-only requires -a <audio_file>\n");
+            return 1;
+        }
+
+        qwen3_tts::Qwen3TTS tts;
+
+        if (vad_only_mode) {
+            if (vad_model_file.empty()) {
+                fprintf(stderr, "Error: --vad-only requires --vad-model <file>\n");
+                return 1;
+            }
+            std::vector<qwen3_tts::vad_segment> segments;
+            if (!tts.detect_vad(audio_file, vad_model_file, segments, vad_maxseg)) {
+                fprintf(stderr, "Error: VAD failed\n");
+                return 1;
+            }
+            for (auto& seg : segments) {
+                printf("%d %d\n", seg.start_ms, seg.end_ms);
+            }
+            fprintf(stderr, "[vad] %zu segments detected\n", segments.size());
+            return 0;
+        }
+
+        // ASR mode
+        if (asr_model_file.empty()) {
+            fprintf(stderr, "Error: --asr requires --asr-model <file>\n");
+            return 1;
+        }
+
+        qwen3_tts::asr_params asr_p;
+        asr_p.vad_model_path = vad_model_file;
+        asr_p.vad_maxseg = vad_maxseg;
+        asr_p.keep_tags = asr_keep_tags;
+        asr_p.output_ids = asr_ids;
+        asr_p.n_threads = params.n_threads > 0 ? params.n_threads : 8;
+
+        auto result = tts.transcribe(audio_file, asr_model_file, asr_p);
+        if (!result.success) {
+            fprintf(stderr, "Error: %s\n", result.error_msg.c_str());
+            return 1;
+        }
+
+        if (asr_ids) {
+            for (int id : result.token_ids) {
+                printf("%d ", id);
+            }
+        } else {
+            printf("%s", result.text.c_str());
+        }
+        printf("\n");
+        fprintf(stderr, "[asr] done %.2fs\n", result.t_total_ms / 1000.0);
+        return 0;
+    }
+
+    // --- TTS mode (original path) ---
+    if (model_dir.empty()) {
+        fprintf(stderr, "Error: model directory is required (use -m <dir>)\n");
+        print_usage(args[0].c_str());
+        return 1;
+    }
+
+    if (text.empty() && extract_speaker_embedding_file.empty()) {
+        fprintf(stderr, "Error: text is required (use -t <text>)\n");
+        print_usage(args[0].c_str());
+        return 1;
+    }
+
     // Initialize TTS
     qwen3_tts::Qwen3TTS tts;
 

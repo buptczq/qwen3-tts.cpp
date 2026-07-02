@@ -65,6 +65,36 @@ class _TtsModelCapabilities(ctypes.Structure):
     ]
 
 
+class _VadSegment(ctypes.Structure):
+    _fields_ = [
+        ("start_ms", _int32),
+        ("end_ms",   _int32),
+    ]
+
+
+class _AsrParams(ctypes.Structure):
+    _fields_ = [
+        ("vad_model_path", _char_ptr),
+        ("vad_maxseg",     _int32),
+        ("keep_tags",      _int32),
+        ("output_ids",     _int32),
+        ("n_threads",      _int32),
+    ]
+
+
+class _AsrResult(ctypes.Structure):
+    _fields_ = [
+        ("text",           _char_ptr),
+        ("token_ids",      ctypes.POINTER(_int32)),
+        ("token_ids_len",  _int32),
+        ("segments",       ctypes.POINTER(_VadSegment)),
+        ("segments_len",   _int32),
+        ("t_total_ms",     _int64),
+        ("success",        _int32),
+        ("error_msg",      _char_ptr),
+    ]
+
+
 # Model kind enum
 QWEN3_TTS_MODEL_KIND_UNKNOWN = 0
 QWEN3_TTS_MODEL_KIND_BASE = 1
@@ -192,6 +222,63 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
 
     lib.qwen3_tts_set_progress_callback.restype = None
     lib.qwen3_tts_set_progress_callback.argtypes = [_void_ptr, _ProgressCallback, _void_ptr]
+
+    # ASR / VAD
+    lib.qwen3_asr_transcribe.restype = _AsrResult
+    lib.qwen3_asr_transcribe.argtypes = [_void_ptr, _char_ptr, _char_ptr, _AsrParams]
+
+    lib.qwen3_vad_detect.restype = _int32
+    lib.qwen3_vad_detect.argtypes = [
+        _void_ptr, _char_ptr, _char_ptr, _int32,
+        ctypes.POINTER(ctypes.POINTER(_VadSegment)),
+        ctypes.POINTER(_int32),
+    ]
+
+    lib.qwen3_vad_free_segments.restype = None
+    lib.qwen3_vad_free_segments.argtypes = [ctypes.POINTER(_VadSegment)]
+
+    lib.qwen3_asr_free_result.restype = None
+    lib.qwen3_asr_free_result.argtypes = [_AsrResult]
+
+    lib.qwen3_asr_load_model.restype = _int32
+    lib.qwen3_asr_load_model.argtypes = [_void_ptr, _char_ptr]
+
+    lib.qwen3_asr_free_model.restype = None
+    lib.qwen3_asr_free_model.argtypes = [_void_ptr]
+
+    lib.qwen3_vad_load_model.restype = _int32
+    lib.qwen3_vad_load_model.argtypes = [_void_ptr, _char_ptr]
+
+    lib.qwen3_vad_free_model.restype = None
+    lib.qwen3_vad_free_model.argtypes = [_void_ptr]
+
+    # Streaming VAD
+    lib.qwen3_vad_stream_new.restype = _void_ptr
+    lib.qwen3_vad_stream_new.argtypes = [_void_ptr, _int32]
+
+    lib.qwen3_vad_stream_feed.restype = _int32
+    lib.qwen3_vad_stream_feed.argtypes = [_void_ptr, ctypes.POINTER(_float), _int32]
+
+    lib.qwen3_vad_stream_get_segment_count.restype = _int32
+    lib.qwen3_vad_stream_get_segment_count.argtypes = [_void_ptr]
+
+    lib.qwen3_vad_stream_get_segment.restype = _int32
+    lib.qwen3_vad_stream_get_segment.argtypes = [_void_ptr, _int32,
+                                                  ctypes.POINTER(_int32), ctypes.POINTER(_int32)]
+
+    lib.qwen3_vad_stream_get_open_segment.restype = _int32
+    lib.qwen3_vad_stream_get_open_segment.argtypes = [_void_ptr,
+                                                       ctypes.POINTER(_int32), ctypes.POINTER(_int32)]
+
+    lib.qwen3_vad_stream_reset.restype = None
+    lib.qwen3_vad_stream_reset.argtypes = [_void_ptr]
+
+    lib.qwen3_vad_stream_free.restype = None
+    lib.qwen3_vad_stream_free.argtypes = [_void_ptr]
+
+    # Streaming ASR
+    lib.qwen3_asr_transcribe_pcm.restype = _AsrResult
+    lib.qwen3_asr_transcribe_pcm.argtypes = [_void_ptr, ctypes.POINTER(_float), _int32, _char_ptr, _AsrParams]
 
 
 # ── Pythonic wrapper ────────────────────────────────────────────────────────
@@ -489,3 +576,246 @@ class Qwen3TTS:
             callback(tokens, max_tokens)
 
         self._lib.qwen3_tts_set_progress_callback(self._ctx, _cb, None)
+
+    # ── ASR / VAD ────────────────────────────────────────────────────────
+
+    def load_asr_model(self, model_gguf: Union[str, Path]) -> bool:
+        """Pre-load and cache an ASR model to avoid reloading on every transcribe call.
+
+        Model type is auto-detected from path (path contains "paraformer" -> Paraformer,
+        else SenseVoice). Returns True on success.
+        """
+        return bool(self._lib.qwen3_asr_load_model(
+            self._ctx, str(model_gguf).encode("utf-8")))
+
+    def free_asr_model(self) -> None:
+        """Free the cached ASR model."""
+        self._lib.qwen3_asr_free_model(self._ctx)
+
+    def transcribe(
+        self,
+        audio_path: Union[str, Path],
+        model_gguf: Optional[Union[str, Path]] = None,
+        vad_model: Optional[Union[str, Path]] = None,
+        vad_maxseg: int = 30000,
+        keep_tags: bool = False,
+        output_ids: bool = False,
+        n_threads: int = 8,
+    ) -> dict:
+        """Transcribe an audio file using SenseVoice or Paraformer.
+
+        Parameters
+        ----------
+        audio_path : path to WAV file (any sample rate)
+        model_gguf : path to ASR model GGUF, or None to use cached model
+                     (must call load_asr_model() first if None)
+        vad_model  : optional path to FSMN-VAD GGUF for long audio segmentation
+        vad_maxseg : max VAD segment duration in ms
+        keep_tags  : keep <|...|> meta tags (SenseVoice only)
+        output_ids : return token IDs instead of text
+        n_threads  : CPU threads
+
+        Returns
+        -------
+        dict with keys:
+            success (bool), text (str), token_ids (list[int]),
+            segments (list[dict(start_ms, end_ms)]),
+            t_total_ms (int), error_msg (str)
+        """
+        p = _AsrParams()
+        p.vad_model_path = str(vad_model).encode("utf-8") if vad_model else None
+        p.vad_maxseg = vad_maxseg
+        p.keep_tags = int(keep_tags)
+        p.output_ids = int(output_ids)
+        p.n_threads = n_threads
+
+        model_path = str(model_gguf).encode("utf-8") if model_gguf else None
+        res = self._lib.qwen3_asr_transcribe(
+            self._ctx,
+            str(audio_path).encode("utf-8"),
+            model_path,
+            p,
+        )
+
+        result = {
+            "success": bool(res.success),
+            "text": res.text.decode("utf-8") if res.text else "",
+            "token_ids": [],
+            "segments": [],
+            "t_total_ms": res.t_total_ms,
+            "error_msg": res.error_msg.decode("utf-8") if res.error_msg else "",
+        }
+
+        if res.token_ids and res.token_ids_len > 0:
+            buf = (ctypes.c_int32 * res.token_ids_len).from_address(
+                ctypes.addressof(res.token_ids.contents)
+            )
+            result["token_ids"] = list(buf)
+
+        if res.segments and res.segments_len > 0:
+            for i in range(res.segments_len):
+                result["segments"].append({
+                    "start_ms": res.segments[i].start_ms,
+                    "end_ms": res.segments[i].end_ms,
+                })
+
+        self._lib.qwen3_asr_free_result(res)
+        return result
+
+    def detect_vad(
+        self,
+        audio_path: Union[str, Path],
+        vad_gguf: Union[str, Path],
+        maxseg_ms: int = 30000,
+    ) -> list[dict]:
+        """Detect speech segments using FSMN-VAD.
+
+        Returns
+        -------
+        list of dicts with keys: start_ms, end_ms
+        """
+        segs_ptr = ctypes.POINTER(_VadSegment)()
+        segs_len = _int32()
+
+        ok = self._lib.qwen3_vad_detect(
+            self._ctx,
+            str(audio_path).encode("utf-8"),
+            str(vad_gguf).encode("utf-8"),
+            maxseg_ms,
+            ctypes.byref(segs_ptr),
+            ctypes.byref(segs_len),
+        )
+
+        segments = []
+        if ok and segs_len.value > 0 and segs_ptr:
+            for i in range(segs_len.value):
+                segments.append({
+                    "start_ms": segs_ptr[i].start_ms,
+                    "end_ms": segs_ptr[i].end_ms,
+                })
+            self._lib.qwen3_vad_free_segments(segs_ptr)
+
+        return segments
+
+    def load_vad_model(self, vad_gguf: Union[str, Path]) -> bool:
+        """Pre-load and cache a VAD model to avoid reloading on every detect call."""
+        return bool(self._lib.qwen3_vad_load_model(
+            self._ctx, str(vad_gguf).encode("utf-8")))
+
+    def free_vad_model(self) -> None:
+        """Free the cached VAD model."""
+        self._lib.qwen3_vad_free_model(self._ctx)
+
+    def create_vad_stream(self, max_seg_ms: int = 30000) -> 'VadStream':
+        """Create a streaming VAD context. Requires a cached VAD model."""
+        return VadStream(self._lib, self._ctx, max_seg_ms)
+
+    def transcribe_pcm(
+        self,
+        pcm: np.ndarray,
+        model_gguf: Optional[Union[str, Path]] = None,
+        keep_tags: bool = False,
+        output_ids: bool = False,
+        n_threads: int = 8,
+    ) -> dict:
+        """Transcribe PCM samples (f32, 16kHz mono) using cached ASR model.
+
+        Parameters
+        ----------
+        pcm : numpy array of float32 samples at 16kHz mono
+        model_gguf : path to ASR model, or None to use cached model
+        keep_tags : keep <|...|> meta tags (SenseVoice only)
+        output_ids : return token IDs instead of text
+        n_threads : CPU threads
+
+        Returns
+        -------
+        dict with keys: success, text, token_ids, t_total_ms, error_msg
+        """
+        pcm = np.ascontiguousarray(pcm, dtype=np.float32)
+        p = _AsrParams()
+        p.vad_model_path = None
+        p.vad_maxseg = 30000
+        p.keep_tags = int(keep_tags)
+        p.output_ids = int(output_ids)
+        p.n_threads = n_threads
+
+        model_path = str(model_gguf).encode("utf-8") if model_gguf else None
+        res = self._lib.qwen3_asr_transcribe_pcm(
+            self._ctx,
+            pcm.ctypes.data_as(ctypes.POINTER(_float)),
+            pcm.size,
+            model_path,
+            p,
+        )
+
+        result = {
+            "success": bool(res.success),
+            "text": res.text.decode("utf-8") if res.text else "",
+            "token_ids": [],
+            "t_total_ms": res.t_total_ms,
+            "error_msg": res.error_msg.decode("utf-8") if res.error_msg else "",
+        }
+
+        if res.token_ids and res.token_ids_len > 0:
+            buf = (ctypes.c_int32 * res.token_ids_len).from_address(
+                ctypes.addressof(res.token_ids.contents)
+            )
+            result["token_ids"] = list(buf)
+
+        self._lib.qwen3_asr_free_result(res)
+        return result
+
+
+class VadStream:
+    """Streaming VAD context. Feed PCM chunks and get speech segments incrementally."""
+
+    def __init__(self, lib, ctx, max_seg_ms: int = 30000):
+        self._lib = lib
+        self._stream = lib.qwen3_vad_stream_new(ctx, max_seg_ms)
+        if not self._stream:
+            raise RuntimeError("Failed to create VAD stream (is VAD model loaded?)")
+
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        if getattr(self, '_stream', None):
+            self._lib.qwen3_vad_stream_free(self._stream)
+            self._stream = None
+
+    def feed(self, pcm: np.ndarray) -> bool:
+        """Feed PCM samples (f32, 16kHz mono). Returns True on success."""
+        pcm = np.ascontiguousarray(pcm, dtype=np.float32)
+        return bool(self._lib.qwen3_vad_stream_feed(
+            self._stream,
+            pcm.ctypes.data_as(ctypes.POINTER(_float)),
+            pcm.size,
+        ))
+
+    def get_segments(self) -> list[dict]:
+        """Get all completed speech segments."""
+        count = self._lib.qwen3_vad_stream_get_segment_count(self._stream)
+        segments = []
+        start = _int32()
+        end = _int32()
+        for i in range(count):
+            if self._lib.qwen3_vad_stream_get_segment(
+                self._stream, i, ctypes.byref(start), ctypes.byref(end)
+            ):
+                segments.append({"start_ms": start.value, "end_ms": end.value})
+        return segments
+
+    def get_open_segment(self) -> Optional[dict]:
+        """Get the current in-progress segment, if any."""
+        start = _int32()
+        end = _int32()
+        if self._lib.qwen3_vad_stream_get_open_segment(
+            self._stream, ctypes.byref(start), ctypes.byref(end)
+        ):
+            return {"start_ms": start.value, "end_ms": end.value}
+        return None
+
+    def reset(self) -> None:
+        """Reset the stream state (clear all segments)."""
+        self._lib.qwen3_vad_stream_reset(self._stream)

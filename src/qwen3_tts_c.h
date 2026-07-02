@@ -155,6 +155,126 @@ QWEN3_TTS_API void qwen3_tts_set_progress_callback(
     void* user_data
 );
 
+// ===== ASR / VAD =====
+
+typedef struct {
+    int32_t start_ms;
+    int32_t end_ms;
+} qwen3_vad_segment_t;
+
+typedef struct {
+    const char* vad_model_path;   // NULL = no VAD segmentation
+    int32_t vad_maxseg;           // max segment duration in ms (default 30000)
+    int32_t keep_tags;            // keep <|...|> meta tags in SenseVoice output
+    int32_t output_ids;           // output token IDs instead of text
+    int32_t n_threads;            // CPU threads (default 8)
+} qwen3_asr_params_t;
+
+typedef struct {
+    char* text;                           // heap-allocated, free with qwen3_asr_free_result
+    int32_t* token_ids;                   // heap-allocated array (NULL if output_ids=0)
+    int32_t token_ids_len;
+    qwen3_vad_segment_t* segments;        // heap-allocated array (NULL if no VAD)
+    int32_t segments_len;
+    int64_t t_total_ms;
+    int32_t success;
+    char* error_msg;                      // heap-allocated, free with qwen3_asr_free_result
+} qwen3_asr_result_t;
+
+// Transcribe an audio file (WAV, any sample rate).
+// model_gguf: path to SenseVoice or Paraformer GGUF file.
+// The model type is auto-detected from the file path (path contains "paraformer" -> Paraformer, else SenseVoice).
+QWEN3_TTS_API qwen3_asr_result_t qwen3_asr_transcribe(
+    qwen3_tts_context_t* ctx,
+    const char* audio_path,
+    const char* model_gguf,
+    qwen3_asr_params_t params
+);
+
+// Detect speech segments using FSMN-VAD.
+// Returns segments via output params. Returns 1 on success, 0 on failure.
+// Caller must free *out_segments with qwen3_vad_free_segments() when done.
+QWEN3_TTS_API int32_t qwen3_vad_detect(
+    qwen3_tts_context_t* ctx,
+    const char* audio_path,
+    const char* vad_gguf,
+    int32_t maxseg_ms,
+    qwen3_vad_segment_t** out_segments,
+    int32_t* out_segments_len
+);
+
+QWEN3_TTS_API void qwen3_vad_free_segments(qwen3_vad_segment_t* segments);
+
+QWEN3_TTS_API void qwen3_asr_free_result(qwen3_asr_result_t result);
+
+// Pre-load and cache an ASR model (SenseVoice or Paraformer) to avoid reloading on every transcribe call.
+// Model type is auto-detected from path (path contains "paraformer" -> Paraformer, else SenseVoice).
+// Returns 1 on success, 0 on failure.
+QWEN3_TTS_API int32_t qwen3_asr_load_model(qwen3_tts_context_t* ctx, const char* model_gguf);
+
+// Free the cached ASR model.
+QWEN3_TTS_API void qwen3_asr_free_model(qwen3_tts_context_t* ctx);
+
+// Pre-load and cache a VAD model to avoid reloading on every detect call.
+// Returns 1 on success, 0 on failure.
+QWEN3_TTS_API int32_t qwen3_vad_load_model(qwen3_tts_context_t* ctx, const char* vad_gguf);
+
+// Free the cached VAD model.
+QWEN3_TTS_API void qwen3_vad_free_model(qwen3_tts_context_t* ctx);
+
+// ===== Streaming VAD/ASR =====
+
+// Opaque handle for streaming VAD state
+typedef struct qwen3_vad_stream qwen3_vad_stream_t;
+
+// Create a new streaming VAD context using the cached VAD model.
+// Returns NULL if no VAD model is cached.
+QWEN3_TTS_API qwen3_vad_stream_t* qwen3_vad_stream_new(qwen3_tts_context_t* ctx, int32_t max_seg_ms);
+
+// Feed PCM samples (f32, 16kHz mono) to the streaming VAD.
+// Returns 1 on success, 0 on failure.
+// New segments are available via qwen3_vad_stream_get_segments().
+QWEN3_TTS_API int32_t qwen3_vad_stream_feed(
+    qwen3_vad_stream_t* stream,
+    const float* pcm,
+    int32_t n_samples
+);
+
+// Get the number of completed segments.
+QWEN3_TTS_API int32_t qwen3_vad_stream_get_segment_count(qwen3_vad_stream_t* stream);
+
+// Get a completed segment by index. Returns 1 on success, 0 on failure.
+QWEN3_TTS_API int32_t qwen3_vad_stream_get_segment(
+    qwen3_vad_stream_t* stream,
+    int32_t index,
+    int32_t* out_start_ms,
+    int32_t* out_end_ms
+);
+
+// Get the current open (in-progress) segment, if any.
+// Returns 1 if there's an open segment, 0 if none.
+QWEN3_TTS_API int32_t qwen3_vad_stream_get_open_segment(
+    qwen3_vad_stream_t* stream,
+    int32_t* out_start_ms,
+    int32_t* out_end_ms
+);
+
+// Reset the streaming VAD state (clear all segments and accumulated state).
+QWEN3_TTS_API void qwen3_vad_stream_reset(qwen3_vad_stream_t* stream);
+
+// Free the streaming VAD context.
+QWEN3_TTS_API void qwen3_vad_stream_free(qwen3_vad_stream_t* stream);
+
+// Streaming ASR: transcribe PCM samples (f32, 16kHz mono) using cached ASR model.
+// Returns transcription result. If model_gguf is NULL, uses cached model.
+QWEN3_TTS_API qwen3_asr_result_t qwen3_asr_transcribe_pcm(
+    qwen3_tts_context_t* ctx,
+    const float* pcm,
+    int32_t n_samples,
+    const char* model_gguf,  // NULL = use cached model
+    qwen3_asr_params_t params
+);
+
 #ifdef __cplusplus
 }
 #endif
