@@ -10,8 +10,7 @@ class Qwen3TTS;
 struct tts_params;
 struct tts_result;
 struct tts_streaming_params;
-struct tts_audio_chunk;
-using tts_audio_chunk_callback_t = std::function<bool(const tts_audio_chunk &)>;
+using tts_audio_chunk_callback_t = std::function<bool(const float *, int32_t, int32_t)>;
 namespace pipeline_internal {
 
 struct ops {
