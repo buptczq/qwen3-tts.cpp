@@ -418,6 +418,56 @@ async def test_voice_clone_chinese():
             return ok
 
 
+async def test_concurrent_sessions():
+    """Two WebSocket clients synthesize simultaneously without crashes."""
+    ws_url = f"ws://127.0.0.1:{SERVER_PORT}/ws"
+
+    async def one_client(client_id: int, text: str) -> dict:
+        result = {"id": client_id, "audio_chunks": 0, "done": False, "error": None}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(ws_url, timeout=60) as ws:
+                    await ws.send_json({"text": text, "params": {"temperature": 0, "max_audio_tokens": 64}})
+                    async for msg in ws:
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            continue
+                        try:
+                            data = msg.json()
+                        except json.JSONDecodeError:
+                            continue
+                        msg_type = data.get("type", "")
+                        if msg_type == "audio":
+                            result["audio_chunks"] += 1
+                        elif msg_type == "done":
+                            result["done"] = True
+                            break
+                        elif msg_type == "error":
+                            result["error"] = data.get("message", "unknown")
+                            break
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    print("  Launching 2 concurrent clients...", file=sys.stderr)
+    results = await asyncio.gather(
+        one_client(1, "Hello from client one."),
+        one_client(2, "Greetings from client two."),
+    )
+
+    all_ok = True
+    for r in results:
+        status = "OK" if r["done"] and r["error"] is None else "FAIL"
+        print(f"  Client {r['id']}: {status} (chunks={r['audio_chunks']}, error={r['error']})", file=sys.stderr)
+        if not r["done"] or r["error"] is not None:
+            all_ok = False
+
+    if all_ok:
+        print("  PASS: concurrent sessions completed", file=sys.stderr)
+    else:
+        print("  FAIL: concurrent sessions had errors", file=sys.stderr)
+    return all_ok
+
+
 async def main():
     print("=" * 50, file=sys.stderr)
     print("Unit tests: split_sentences", file=sys.stderr)
@@ -481,7 +531,10 @@ async def main():
             print("  SKIP: reference audio not available", file=sys.stderr)
             ok4 = True
 
-        all_ok = ok1 and ok2 and ok3 and ok4
+        print("\n=== Test 5: Concurrent sessions ===", file=sys.stderr)
+        ok5 = await test_concurrent_sessions()
+
+        all_ok = ok1 and ok2 and ok3 and ok4 and ok5
         print("\n" + "=" * 40, file=sys.stderr)
         if all_ok:
             print("ALL TESTS PASSED!", file=sys.stderr)

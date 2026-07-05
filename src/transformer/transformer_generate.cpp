@@ -27,6 +27,33 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                               int32_t n_reference_frames,
                               int32_t n_reference_codebooks,
                               const tts_code_frame_callback_t * frame_callback) {
+    ensure_default_session();
+    return generate(*default_session_, text_tokens, n_tokens, speaker_embd, max_len, output,
+                    language_id, repetition_penalty, temperature, top_k, top_p, seed,
+                    instruct_tokens, n_instruct_tokens,
+                    reference_tokens, n_reference_tokens,
+                    reference_codes, n_reference_frames, n_reference_codebooks,
+                    frame_callback);
+}
+
+bool TTSTransformer::generate(TTSTransformerSession & session,
+                              const int32_t * text_tokens, int32_t n_tokens,
+                              const float * speaker_embd, int32_t max_len,
+                              std::vector<int32_t> & output,
+                              int32_t language_id,
+                              float repetition_penalty,
+                              float temperature,
+                              int32_t top_k,
+                              float top_p,
+                              int64_t seed,
+                              const int32_t * instruct_tokens,
+                              int32_t n_instruct_tokens,
+                              const int32_t * reference_tokens,
+                              int32_t n_reference_tokens,
+                              const int32_t * reference_codes,
+                              int32_t n_reference_frames,
+                              int32_t n_reference_codebooks,
+                              const tts_code_frame_callback_t * frame_callback) {
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
@@ -70,7 +97,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    if (!transformer_internal::ops::build_prefill_graph(*this, text_tokens, n_tokens, speaker_embd, language_id,
+    if (!transformer_internal::ops::build_prefill_graph(*this, session, text_tokens, n_tokens, speaker_embd, language_id,
                              prefill_embd, trailing_text_hidden, tts_pad_embed,
                              instruct_tokens, n_instruct_tokens,
                              reference_tokens, n_reference_tokens,
@@ -104,19 +131,19 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     }
 
     const int32_t required_ctx = prefill_len + max_len + 8;
-    if (impl_->state.cache.n_ctx < required_ctx || impl_->state.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
-        if (!init_kv_cache(required_ctx)) {
+    if (session.state_.cache.n_ctx < required_ctx || session.state_.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
+        if (!init_kv_cache(session, required_ctx)) {
             return false;
         }
     }
-    clear_kv_cache();
+    clear_kv_cache(session);
 
-    if (impl_->state.code_pred_cache.n_ctx < 16) {
-        if (!init_code_pred_kv_cache(16)) {
+    if (session.state_.code_pred_cache.n_ctx < 16) {
+        if (!init_code_pred_kv_cache(session, 16)) {
             return false;
         }
     }
-    transformer_internal::ops::maybe_reserve_scheduler_graphs(*this, prefill_len, required_ctx);
+    transformer_internal::ops::maybe_reserve_scheduler_graphs(*this, session, prefill_len, required_ctx);
 
     std::vector<float> hidden_out;
     std::vector<float> logits;
@@ -124,7 +151,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    if (!forward_prefill(prefill_embd.data(), prefill_len, 0, hidden_out, &logits)) {
+    if (!forward_prefill(session, prefill_embd.data(), prefill_len, 0, hidden_out, &logits)) {
         return false;
     }
 #ifdef QWEN3_TTS_TIMING
@@ -208,16 +235,16 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 
             char hidden_name[128];
             snprintf(hidden_name, sizeof(hidden_name), "frame%03d_talker_hidden.f32.bin", frame);
-            transformer_internal::debug_trace_write_bin(trace_cfg, hidden_name, last_hidden_.data(),
-                                                        last_hidden_.size(), "f32",
-                                                        {(int64_t) last_hidden_.size()});
+            transformer_internal::debug_trace_write_bin(trace_cfg, hidden_name, session.last_hidden_.data(),
+                                                        session.last_hidden_.size(), "f32",
+                                                        {(int64_t) session.last_hidden_.size()});
         }
 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
         std::vector<int32_t> codes_1_15;
-        if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15,
+        if (!predict_codes_autoregressive(session, session.last_hidden_.data(), frame_codes[0], codes_1_15,
                                           temperature, top_k, top_p,
                                           sampling.seed, &sampling.subseq, frame)) {
             return false;
@@ -263,7 +290,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (!transformer_internal::ops::lookup_single_embedding_row(*this, impl_->model.codec_embd, frame_codes[0], embd_row.data())) {
+        if (!transformer_internal::ops::lookup_single_embedding_row(*this, session, impl_->model.codec_embd, frame_codes[0], embd_row.data())) {
             return false;
         }
         for (int32_t h = 0; h < cfg.hidden_size; ++h) {
@@ -272,7 +299,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 
         for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
             int32_t code_token = frame_codes[cb];
-            if (!transformer_internal::ops::lookup_single_embedding_row(*this, impl_->model.code_pred_embd[cb - 1], code_token, embd_row.data())) {
+            if (!transformer_internal::ops::lookup_single_embedding_row(*this, session, impl_->model.code_pred_embd[cb - 1], code_token, embd_row.data())) {
                 return false;
             }
             for (int32_t h = 0; h < cfg.hidden_size; ++h) {
@@ -294,7 +321,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (!forward_step(step_embd.data(), n_past, logits)) {
+        if (!forward_step(session, step_embd.data(), n_past, logits)) {
             return false;
         }
 #ifdef QWEN3_TTS_TIMING

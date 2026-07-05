@@ -8,7 +8,12 @@
 
 namespace qwen3_tts {
 
-bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_tokens,
+// ---------------------------------------------------------------------------
+// Session-aware primary implementations
+// ---------------------------------------------------------------------------
+
+bool TTSTransformer::forward_prefill(TTSTransformerSession & session,
+                                     const float * prefill_embd, int32_t n_tokens,
                                      int32_t n_past, std::vector<float> & output,
                                      std::vector<float> * logits_out) {
     if (!impl_->model.ctx) {
@@ -24,14 +29,14 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
         return false;
     }
 
-    if (impl_->state.cache.n_ctx == 0) {
+    if (session.state_.cache.n_ctx == 0) {
         const int32_t min_ctx = std::max<int32_t>(256, n_past + n_tokens + 16);
-        if (!init_kv_cache(min_ctx)) {
+        if (!init_kv_cache(session, min_ctx)) {
             return false;
         }
     }
 
-    if (n_past + n_tokens > impl_->state.cache.n_ctx) {
+    if (n_past + n_tokens > session.state_.cache.n_ctx) {
         error_msg_ = "Context length exceeded";
         return false;
     }
@@ -44,7 +49,7 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    struct ggml_cgraph * gf = transformer_internal::ops::build_prefill_forward_graph(*this, n_tokens, n_past);
+    struct ggml_cgraph * gf = transformer_internal::ops::build_prefill_forward_graph(*this, session, n_tokens, n_past);
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (impl_->timing) impl_->timing->t_prefill_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -53,7 +58,7 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    if (!ggml_backend_sched_alloc_graph(impl_->state.sched, gf)) {
+    if (!ggml_backend_sched_alloc_graph(session.state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
         return false;
     }
@@ -108,9 +113,9 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    if (ggml_backend_sched_graph_compute(impl_->state.sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(session.state_.sched, gf) != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute graph";
-        ggml_backend_sched_reset(impl_->state.sched);
+        ggml_backend_sched_reset(session.state_.sched);
         return false;
     }
 #ifdef QWEN3_TTS_TIMING
@@ -121,7 +126,7 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
     struct ggml_tensor * hidden = ggml_graph_get_tensor(gf, "hidden_states");
     if (!hidden) {
         error_msg_ = "Failed to find hidden_states tensor";
-        ggml_backend_sched_reset(impl_->state.sched);
+        ggml_backend_sched_reset(session.state_.sched);
         return false;
     }
 
@@ -131,8 +136,8 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
     output.resize(n_tokens * impl_->model.config.hidden_size);
     ggml_backend_tensor_get(hidden, output.data(), 0, output.size() * sizeof(float));
 
-    last_hidden_.resize(impl_->model.config.hidden_size);
-    ggml_backend_tensor_get(hidden, last_hidden_.data(),
+    session.last_hidden_.resize(impl_->model.config.hidden_size);
+    ggml_backend_tensor_get(hidden, session.last_hidden_.data(),
                             (n_tokens - 1) * impl_->model.config.hidden_size * sizeof(float),
                             impl_->model.config.hidden_size * sizeof(float));
 
@@ -140,7 +145,7 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
         struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
         if (!logits) {
             error_msg_ = "Failed to find logits tensor";
-            ggml_backend_sched_reset(impl_->state.sched);
+            ggml_backend_sched_reset(session.state_.sched);
             return false;
         }
 
@@ -150,9 +155,9 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
                                 impl_->model.config.codec_vocab_size * sizeof(float));
     }
 
-    impl_->state.cache.n_used = n_past + n_tokens;
+    session.state_.cache.n_used = n_past + n_tokens;
 
-    ggml_backend_sched_reset(impl_->state.sched);
+    ggml_backend_sched_reset(session.state_.sched);
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (impl_->timing) impl_->timing->t_prefill_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -161,7 +166,8 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
     return true;
 }
 
-bool TTSTransformer::forward_text(const int32_t * text_tokens, int32_t n_tokens,
+bool TTSTransformer::forward_text(TTSTransformerSession & session,
+                                  const int32_t * text_tokens, int32_t n_tokens,
                                   const float * speaker_embd, int32_t n_past,
                                   std::vector<float> & output) {
     if (!text_tokens) {
@@ -174,7 +180,7 @@ bool TTSTransformer::forward_text(const int32_t * text_tokens, int32_t n_tokens,
     }
 
     std::vector<float> projected;
-    if (!transformer_internal::ops::project_text_tokens(*this, text_tokens, n_tokens, projected)) {
+    if (!transformer_internal::ops::project_text_tokens(*this, session, text_tokens, n_tokens, projected)) {
         return false;
     }
 
@@ -188,10 +194,11 @@ bool TTSTransformer::forward_text(const int32_t * text_tokens, int32_t n_tokens,
         }
     }
 
-    return forward_prefill(projected.data(), n_tokens, n_past, output, nullptr);
+    return forward_prefill(session, projected.data(), n_tokens, n_past, output, nullptr);
 }
 
-bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
+bool TTSTransformer::forward_step(TTSTransformerSession & session,
+                                  const float * step_embd, int32_t n_past,
                                   std::vector<float> & output,
                                   std::vector<float> * hidden_out) {
     if (!impl_->model.ctx) {
@@ -203,14 +210,14 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
         return false;
     }
 
-    if (impl_->state.cache.n_ctx == 0) {
+    if (session.state_.cache.n_ctx == 0) {
         const int32_t min_ctx = std::max<int32_t>(256, n_past + 1 + 16);
-        if (!init_kv_cache(min_ctx)) {
+        if (!init_kv_cache(session, min_ctx)) {
             return false;
         }
     }
 
-    if (n_past + 1 > impl_->state.cache.n_ctx) {
+    if (n_past + 1 > session.state_.cache.n_ctx) {
         error_msg_ = "Context length exceeded";
         return false;
     }
@@ -223,7 +230,7 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    struct ggml_cgraph * gf = transformer_internal::ops::build_step_graph(*this, n_past);
+    struct ggml_cgraph * gf = transformer_internal::ops::build_step_graph(*this, session, n_past);
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (impl_->timing) impl_->timing->t_talker_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -232,7 +239,7 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    if (!ggml_backend_sched_alloc_graph(impl_->state.sched, gf)) {
+    if (!ggml_backend_sched_alloc_graph(session.state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
         return false;
     }
@@ -264,13 +271,13 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 
     struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
     if (inp_mask) {
-        std::vector<ggml_fp16_t> mask(impl_->state.cache.n_ctx);
+        std::vector<ggml_fp16_t> mask(session.state_.cache.n_ctx);
         const ggml_fp16_t zero_fp16 = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t neg_inf_fp16 = ggml_fp32_to_fp16(-INFINITY);
-        for (int i = 0; i < impl_->state.cache.n_ctx; ++i) {
+        for (int i = 0; i < session.state_.cache.n_ctx; ++i) {
             mask[(size_t) i] = (i <= n_past) ? zero_fp16 : neg_inf_fp16;
         }
-        ggml_backend_tensor_set(inp_mask, mask.data(), 0, impl_->state.cache.n_ctx * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(inp_mask, mask.data(), 0, session.state_.cache.n_ctx * sizeof(ggml_fp16_t));
     }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
@@ -280,9 +287,9 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    if (ggml_backend_sched_graph_compute(impl_->state.sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(session.state_.sched, gf) != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute graph";
-        ggml_backend_sched_reset(impl_->state.sched);
+        ggml_backend_sched_reset(session.state_.sched);
         return false;
     }
 #ifdef QWEN3_TTS_TIMING
@@ -293,37 +300,37 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
     struct ggml_tensor * hidden = ggml_graph_get_tensor(gf, "hidden_states");
     if (!hidden) {
         error_msg_ = "Failed to find hidden_states tensor";
-        ggml_backend_sched_reset(impl_->state.sched);
+        ggml_backend_sched_reset(session.state_.sched);
         return false;
     }
 
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    last_hidden_.resize(impl_->model.config.hidden_size);
+    session.last_hidden_.resize(impl_->model.config.hidden_size);
     if (hidden_out) {
         hidden_out->resize(impl_->model.config.hidden_size);
         ggml_backend_tensor_get(hidden, hidden_out->data(), 0,
                                 impl_->model.config.hidden_size * sizeof(float));
-        last_hidden_ = *hidden_out;
+        session.last_hidden_ = *hidden_out;
     } else {
-        ggml_backend_tensor_get(hidden, last_hidden_.data(), 0,
+        ggml_backend_tensor_get(hidden, session.last_hidden_.data(), 0,
                                 impl_->model.config.hidden_size * sizeof(float));
     }
 
     struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     if (!logits) {
         error_msg_ = "Failed to find logits tensor";
-        ggml_backend_sched_reset(impl_->state.sched);
+        ggml_backend_sched_reset(session.state_.sched);
         return false;
     }
 
     output.resize(impl_->model.config.codec_vocab_size);
     ggml_backend_tensor_get(logits, output.data(), 0, output.size() * sizeof(float));
 
-    impl_->state.cache.n_used = n_past + 1;
+    session.state_.cache.n_used = n_past + 1;
 
-    ggml_backend_sched_reset(impl_->state.sched);
+    ggml_backend_sched_reset(session.state_.sched);
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (impl_->timing) impl_->timing->t_talker_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -332,16 +339,57 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
     return true;
 }
 
-bool TTSTransformer::forward_codec(int32_t codec_token, int32_t n_past,
+bool TTSTransformer::forward_codec(TTSTransformerSession & session,
+                                   int32_t codec_token, int32_t n_past,
                                    std::vector<float> & output) {
     std::vector<float> codec_row;
-    if (!transformer_internal::ops::lookup_embedding_rows(*this, impl_->model.codec_embd, &codec_token, 1,
+    if (!transformer_internal::ops::lookup_embedding_rows(*this, session, impl_->model.codec_embd, &codec_token, 1,
                                "inp_legacy_codec_token", "legacy_codec_row",
                                codec_row)) {
         return false;
     }
 
-    return forward_step(codec_row.data(), n_past, output, nullptr);
+    return forward_step(session, codec_row.data(), n_past, output, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Backward-compat wrappers (delegate to default session)
+// ---------------------------------------------------------------------------
+
+bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_tokens,
+                                     int32_t n_past, std::vector<float> & output,
+                                     std::vector<float> * logits_out) {
+    ensure_default_session();
+    bool ok = forward_prefill(*default_session_, prefill_embd, n_tokens, n_past, output, logits_out);
+    // Mirror session last_hidden_ back to member for backward-compat callers
+    last_hidden_ = default_session_->last_hidden_;
+    return ok;
+}
+
+bool TTSTransformer::forward_text(const int32_t * text_tokens, int32_t n_tokens,
+                                  const float * speaker_embd, int32_t n_past,
+                                  std::vector<float> & output) {
+    ensure_default_session();
+    bool ok = forward_text(*default_session_, text_tokens, n_tokens, speaker_embd, n_past, output);
+    last_hidden_ = default_session_->last_hidden_;
+    return ok;
+}
+
+bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
+                                  std::vector<float> & output,
+                                  std::vector<float> * hidden_out) {
+    ensure_default_session();
+    bool ok = forward_step(*default_session_, step_embd, n_past, output, hidden_out);
+    last_hidden_ = default_session_->last_hidden_;
+    return ok;
+}
+
+bool TTSTransformer::forward_codec(int32_t codec_token, int32_t n_past,
+                                   std::vector<float> & output) {
+    ensure_default_session();
+    bool ok = forward_codec(*default_session_, codec_token, n_past, output);
+    last_hidden_ = default_session_->last_hidden_;
+    return ok;
 }
 
 } // namespace qwen3_tts

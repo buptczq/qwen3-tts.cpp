@@ -25,8 +25,8 @@ std::string filename_lower(const std::string & path) {
 } // namespace
 
 void TTSTransformer::unload_model() {
-    free_tts_kv_cache(impl_->state.cache);
-    free_tts_kv_cache(impl_->state.code_pred_cache);
+    default_session_.reset();
+
     free_transformer_model(impl_->model);
 
     impl_->coreml_code_predictor.unload();
@@ -34,14 +34,6 @@ void TTSTransformer::unload_model() {
     impl_->coreml_code_predictor_path.clear();
     impl_->skip_ggml_code_pred_layers = false;
 
-    if (impl_->state.sched) {
-        ggml_backend_sched_free(impl_->state.sched);
-        impl_->state.sched = nullptr;
-    }
-    impl_->state.sched_reserved = false;
-    impl_->state.sched_reserve_failed = false;
-    impl_->state.sched_reserved_ctx = 0;
-    impl_->state.sched_reserved_prefill_len = 0;
     if (impl_->state.backend) {
         release_preferred_backend(impl_->state.backend);
         impl_->state.backend = nullptr;
@@ -51,10 +43,7 @@ void TTSTransformer::unload_model() {
         impl_->state.backend_cpu = nullptr;
     }
 
-    impl_->state.compute_meta.clear();
-    impl_->state.code_pred_mask.clear();
     last_hidden_.clear();
-    impl_->embd_row_fp16_scratch.clear();
 }
 
 bool TTSTransformer::load_model(const std::string & model_path) {
@@ -168,23 +157,6 @@ bool TTSTransformer::load_model(const std::string & model_path) {
             error_msg_ = "Failed to initialize CPU fallback backend for TTSTransformer";
             return false;
         }
-    }
-
-    std::vector<ggml_backend_t> backends;
-    backends.push_back(impl_->state.backend);
-    if (impl_->state.backend_cpu) {
-        backends.push_back(impl_->state.backend_cpu);
-    }
-    impl_->state.sched = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(), QWEN3_TTS_MAX_NODES, false, true);
-    if (!impl_->state.sched) {
-        error_msg_ = "Failed to create backend scheduler";
-        return false;
-    }
-
-    impl_->state.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead());
-    impl_->state.code_pred_compute_meta.resize(15);
-    for (int i = 0; i < 15; ++i) {
-        impl_->state.code_pred_compute_meta[i].resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead());
     }
 
     if (!transformer_internal::ops::try_init_coreml_code_predictor(*this, model_path)) {

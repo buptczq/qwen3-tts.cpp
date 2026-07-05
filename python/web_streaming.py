@@ -237,17 +237,29 @@ class ClientSession:
         self._current: Optional[Request] = None
         self._cancel_event = asyncio.Event()
         self._worker_task: Optional[asyncio.Task] = None
+        self._thread_future: Optional[asyncio.Future] = None
+        self._session = tts.create_session()
 
     async def start(self):
         self._worker_task = asyncio.create_task(self._worker_loop())
 
     async def stop(self):
+        self._cancel_event.set()
         if self._worker_task:
             self._worker_task.cancel()
             try:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
+        if self._thread_future is not None:
+            try:
+                await asyncio.wait_for(self._thread_future, timeout=10.0)
+            except Exception:
+                pass
+            self._thread_future = None
+        if self._session:
+            self._session.close()
+            self._session = None
 
     async def enqueue(self, text: str, params: dict) -> str:
         req = Request(id=uuid.uuid4().hex[:12], text=text, params=params)
@@ -391,15 +403,16 @@ class ClientSession:
 
                 try:
                     if ref_path:
-                        self._tts.synthesize_with_voice_streaming(
-                            sentence, ref_path,
+                        self._tts.synthesize_with_voice_streaming_session(
+                            self._session, sentence, ref_path,
                             on_audio_chunk=_on_chunk,
                             reference_text=ref_text,
                             **sentence_params,
                         )
                     else:
-                        self._tts.synthesize_streaming(
-                            sentence, on_audio_chunk=_on_chunk, **sentence_params,
+                        self._tts.synthesize_streaming_session(
+                            self._session, sentence,
+                            on_audio_chunk=_on_chunk, **sentence_params,
                         )
                 except Exception as e:
                     asyncio.run_coroutine_threadsafe(
@@ -430,7 +443,7 @@ class ClientSession:
                 chunk_queue.put(_CHUNK_END), loop
             ).result()
 
-        thread_task = loop.run_in_executor(None, _run)
+        self._thread_future = loop.run_in_executor(None, _run)
 
         while True:
             item = await chunk_queue.get()
@@ -464,7 +477,8 @@ class ClientSession:
                 "request_id": req.id,
             })
 
-        await thread_task
+        await self._thread_future
+        self._thread_future = None
 
     async def _send(self, msg: dict):
         try:

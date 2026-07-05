@@ -1,20 +1,18 @@
 #pragma once
 
+#include "qwen3_tts.h"
+
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
 
 namespace qwen3_tts {
-class Qwen3TTS;
-struct tts_params;
-struct tts_result;
-struct tts_streaming_params;
-using tts_audio_chunk_callback_t = std::function<bool(const float *, int32_t, int32_t)>;
 namespace pipeline_internal {
 
 struct ops {
     static tts_result synthesize_internal(Qwen3TTS & self,
+                                          Qwen3TTS::Session * session,
                                           const std::string & text,
                                           const float * speaker_embedding,
                                           const tts_params & params,

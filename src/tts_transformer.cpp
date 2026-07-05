@@ -1,5 +1,6 @@
 #include "tts_transformer.h"
 #include "transformer/transformer_state_internal.h"
+#include "ggml-backend.h"
 
 namespace qwen3_tts {
 
@@ -8,11 +9,62 @@ TTSTransformer::TTSTransformer()
 }
 
 TTSTransformer::~TTSTransformer() {
+    default_session_.reset();
     unload_model();
 }
 
 const tts_transformer_config & TTSTransformer::get_config() const {
     return impl_->model.config;
+}
+
+std::unique_ptr<TTSTransformerSession> TTSTransformer::create_session() {
+    auto session = std::make_unique<TTSTransformerSession>();
+    auto & st = session->state_;
+
+    st.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+    if (!st.backend) {
+        st.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    }
+    if (!st.backend) {
+        st.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr);
+    }
+    if (!st.backend) {
+        st.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    }
+    if (!st.backend) {
+        error_msg_ = "Failed to create session backend";
+        return nullptr;
+    }
+    session->own_backend_ = true;
+
+    st.backend_cpu = impl_->state.backend_cpu;
+
+    std::vector<ggml_backend_t> backends;
+    backends.push_back(st.backend);
+    if (st.backend_cpu) {
+        backends.push_back(st.backend_cpu);
+    }
+    st.sched = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(), QWEN3_TTS_MAX_NODES, false, true);
+    if (!st.sched) {
+        error_msg_ = "Failed to create session scheduler";
+        return nullptr;
+    }
+
+    const size_t meta_size = ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead();
+    st.compute_meta.resize(meta_size);
+    st.code_pred_compute_meta.resize(15);
+    for (int i = 0; i < 15; ++i) {
+        st.code_pred_compute_meta[i].resize(meta_size);
+    }
+
+    session->initialized_ = true;
+    return session;
+}
+
+void TTSTransformer::ensure_default_session() {
+    if (!default_session_) {
+        default_session_ = create_session();
+    }
 }
 
 bool TTSTransformer::forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,

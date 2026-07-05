@@ -132,6 +132,53 @@ QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_synthesize_with_speaker_embedding_str
     void* user_data
 );
 
+// ===== Session API =====
+// Opaque session handle for concurrent inference.
+// Each session has its own scheduler, KV caches, and scratch buffers.
+// Multiple sessions can share the same model weights safely from different threads.
+typedef struct qwen3_tts_session qwen3_tts_session_t;
+
+// Create a new inference session. The context must have models loaded.
+// Returns NULL on failure.
+QWEN3_TTS_API qwen3_tts_session_t* qwen3_tts_session_create(qwen3_tts_context_t* ctx);
+
+// Free a session. Must not be used while synthesis is in progress.
+QWEN3_TTS_API void qwen3_tts_session_free(qwen3_tts_session_t* session);
+
+// Session-aware synthesis functions (parallel to existing non-session functions).
+// Each session should be used from ONE thread at a time.
+QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_session_synthesize(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    qwen3_tts_params_t params);
+
+QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_session_synthesize_with_voice(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    const char* reference_audio,
+    const char* reference_text,
+    qwen3_tts_params_t params);
+
+QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_session_synthesize_streaming(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    qwen3_tts_streaming_params_t params,
+    qwen3_tts_audio_chunk_callback callback,
+    void* user_data);
+
+QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_session_synthesize_with_voice_streaming(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    const char* reference_audio,
+    const char* reference_text,
+    qwen3_tts_streaming_params_t params,
+    qwen3_tts_audio_chunk_callback callback,
+    void* user_data);
+
 QWEN3_TTS_API int32_t qwen3_tts_extract_speaker_embedding(
     qwen3_tts_context_t* ctx,
     const char* reference_audio,

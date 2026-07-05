@@ -280,6 +280,53 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
     lib.qwen3_asr_transcribe_pcm.restype = _AsrResult
     lib.qwen3_asr_transcribe_pcm.argtypes = [_void_ptr, ctypes.POINTER(_float), _int32, _char_ptr, _AsrParams]
 
+    # ── Session API ──────────────────────────────────────────────────────
+    lib.qwen3_tts_session_create.restype = _void_ptr
+    lib.qwen3_tts_session_create.argtypes = [_void_ptr]
+
+    lib.qwen3_tts_session_free.restype = None
+    lib.qwen3_tts_session_free.argtypes = [_void_ptr]
+
+    lib.qwen3_tts_session_synthesize.restype = _TtsResult
+    lib.qwen3_tts_session_synthesize.argtypes = [
+        _void_ptr,  # ctx
+        _void_ptr,  # session
+        _char_ptr,  # text
+        _TtsParams,  # params
+    ]
+
+    lib.qwen3_tts_session_synthesize_with_voice.restype = _TtsResult
+    lib.qwen3_tts_session_synthesize_with_voice.argtypes = [
+        _void_ptr,  # ctx
+        _void_ptr,  # session
+        _char_ptr,  # text
+        _char_ptr,  # reference_audio
+        _char_ptr,  # reference_text
+        _TtsParams,  # params
+    ]
+
+    lib.qwen3_tts_session_synthesize_streaming.restype = _TtsResult
+    lib.qwen3_tts_session_synthesize_streaming.argtypes = [
+        _void_ptr,  # ctx
+        _void_ptr,  # session
+        _char_ptr,  # text
+        _TtsStreamingParams,  # params
+        _AudioChunkCallback,  # callback
+        _void_ptr,  # user_data
+    ]
+
+    lib.qwen3_tts_session_synthesize_with_voice_streaming.restype = _TtsResult
+    lib.qwen3_tts_session_synthesize_with_voice_streaming.argtypes = [
+        _void_ptr,  # ctx
+        _void_ptr,  # session
+        _char_ptr,  # text
+        _char_ptr,  # reference_audio
+        _char_ptr,  # reference_text
+        _TtsStreamingParams,  # params
+        _AudioChunkCallback,  # callback
+        _void_ptr,  # user_data
+    ]
+
 
 # ── Pythonic wrapper ────────────────────────────────────────────────────────
 
@@ -304,6 +351,33 @@ class TTSModelCapabilities:
             f"speaker_count={self.speaker_count}, "
             f"model_kind={self.model_kind})"
         )
+
+
+class Qwen3TTSSession:
+    """Per-client inference session for concurrent TTS.
+
+    Create from Qwen3TTS.create_session(). Each session has its own
+    scheduler, KV caches, and scratch buffers. Multiple sessions can
+    share the same model weights safely from different threads.
+    """
+
+    def __init__(self, lib, session_ptr):
+        self._lib = lib
+        self._session = session_ptr
+
+    def close(self):
+        if getattr(self, '_session', None):
+            self._lib.qwen3_tts_session_free(self._session)
+            self._session = None
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 class Qwen3TTS:
@@ -352,6 +426,19 @@ class Qwen3TTS:
             n = model_name.encode("utf-8")
             return bool(self._lib.qwen3_tts_load_models_with_name(self._ctx, d, n))
         return bool(self._lib.qwen3_tts_load_models(self._ctx, d))
+
+    # ── sessions ────────────────────────────────────────────────────────
+
+    def create_session(self) -> Qwen3TTSSession:
+        """Create a new inference session for concurrent use.
+
+        Each session has its own scheduler, KV caches, and scratch buffers.
+        Multiple sessions can safely share the same model weights.
+        """
+        session_ptr = self._lib.qwen3_tts_session_create(self._ctx)
+        if not session_ptr:
+            raise RuntimeError("Failed to create TTS session")
+        return Qwen3TTSSession(self._lib, session_ptr)
 
     # ── capabilities ────────────────────────────────────────────────────
 
@@ -544,6 +631,92 @@ class Qwen3TTS:
 
         # Build positional args for the C function call
         c_args = [self._ctx, text_enc]
+        for a in extra_args:
+            if a is None:
+                c_args.append(None)
+            elif isinstance(a, str):
+                c_args.append(a.encode("utf-8"))
+            else:
+                c_args.append(a)
+        c_args.extend([sp, _c_callback, None])
+
+        res = c_api_func(*c_args)
+        return self._result_to_numpy(res)
+
+    # ── session-aware streaming synthesis ──────────────────────────────
+
+    def synthesize_streaming_session(
+        self,
+        session: Qwen3TTSSession,
+        text: str,
+        on_audio_chunk: Callable[[np.ndarray, int], bool],
+        **params,
+    ) -> tuple:
+        """Session-aware streaming synthesis.
+
+        Same as synthesize_streaming but uses a dedicated session
+        for thread-safe concurrent inference.
+        """
+        return self._streaming_impl_session(
+            self._lib.qwen3_tts_session_synthesize_streaming,
+            session, text, on_audio_chunk,
+            extra_args=(),
+            params=params,
+        )
+
+    def synthesize_with_voice_streaming_session(
+        self,
+        session: Qwen3TTSSession,
+        text: str,
+        reference_audio: Union[str, Path],
+        on_audio_chunk: Callable[[np.ndarray, int], bool],
+        reference_text: Optional[str] = None,
+        **params,
+    ) -> tuple:
+        """Session-aware streaming synthesis with voice cloning.
+
+        Same as synthesize_with_voice_streaming but uses a dedicated session
+        for thread-safe concurrent inference.
+        """
+        return self._streaming_impl_session(
+            self._lib.qwen3_tts_session_synthesize_with_voice_streaming,
+            session, text, on_audio_chunk,
+            extra_args=(str(reference_audio), reference_text),
+            params=params,
+        )
+
+    def _streaming_impl_session(self, c_api_func, session, text, on_audio_chunk,
+                                extra_args=(), params=None):
+        """Common session-aware streaming path: set up C callback and call the C API."""
+        sp = self._build_streaming_params(**(params or {}))
+
+        abort_flag = [False]
+
+        @_AudioChunkCallback
+        def _c_callback(samples_ptr, n_samples, sample_rate, user_data):
+            if abort_flag[0]:
+                return 0
+            if n_samples <= 0:
+                return 1
+            buf = (ctypes.c_float * n_samples).from_address(
+                ctypes.addressof(samples_ptr.contents)
+            )
+            arr = np.frombuffer(buf, dtype=np.float32).copy()
+            try:
+                cont = on_audio_chunk(arr, sample_rate)
+            except Exception:
+                abort_flag[0] = True
+                return 0
+            if not cont:
+                abort_flag[0] = True
+                return 0
+            return 1
+
+        text_enc = text.encode("utf-8")
+
+        # Build positional args for the C function call
+        # Session-aware functions have (ctx, session, text, ...extras, params, callback, user_data)
+        c_args = [self._ctx, session._session, text_enc]
         for a in extra_args:
             if a is None:
                 c_args.append(None)

@@ -1,5 +1,6 @@
 #include "qwen3_tts.h"
 #include "pipeline/pipeline_internal.h"
+#include "transformer/transformer_state_internal.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -233,7 +234,7 @@ tts_result Qwen3TTS::synthesize(const std::string & text,
             fprintf(stderr, "Using named speaker: %s (%zu floats)\n",
                     params.speaker.c_str(), speaker_embedding.size());
         }
-        return ops::synthesize_internal(*this, text, speaker_embedding.data(), params, result);
+        return ops::synthesize_internal(*this, nullptr, text, speaker_embedding.data(), params, result);
     }
 
     const std::string & model_type = transformer_.get_config().tts_model_type;
@@ -242,7 +243,7 @@ tts_result Qwen3TTS::synthesize(const std::string & text,
         return result;
     }
 
-    return ops::synthesize_internal(*this, text, nullptr, params, result);
+    return ops::synthesize_internal(*this, nullptr, text, nullptr, params, result);
 }
 
 tts_result Qwen3TTS::synthesize_with_voice(const std::string & text,
@@ -384,7 +385,7 @@ tts_result Qwen3TTS::synthesize_with_voice(const std::string & text,
         fprintf(stderr, "Speaker embedding extracted: %zu floats\n", speaker_embedding.size());
     }
 
-    return ops::synthesize_internal(*this, text, speaker_embedding.data(), effective_params, result);
+    return ops::synthesize_internal(*this, nullptr, text, speaker_embedding.data(), effective_params, result);
 }
 
 tts_result Qwen3TTS::synthesize_with_speaker_embedding(const std::string & text,
@@ -412,7 +413,7 @@ tts_result Qwen3TTS::synthesize_with_speaker_embedding(const std::string & text,
     }
 
     result.t_encode_ms = 0;
-    return ops::synthesize_internal(*this, text, speaker_embedding.data(), params, result);
+    return ops::synthesize_internal(*this, nullptr, text, speaker_embedding.data(), params, result);
 }
 
 tts_result Qwen3TTS::synthesize_streaming(const std::string & text,
@@ -436,7 +437,7 @@ tts_result Qwen3TTS::synthesize_streaming(const std::string & text,
             result.error_msg = "Failed to resolve speaker '" + params.speaker + "': " + transformer_.get_error();
             return result;
         }
-        return ops::synthesize_internal(*this, text, speaker_embedding.data(), params, result,
+        return ops::synthesize_internal(*this, nullptr, text, speaker_embedding.data(), params, result,
                                         &stream_params, &on_audio_chunk);
     }
 
@@ -446,7 +447,7 @@ tts_result Qwen3TTS::synthesize_streaming(const std::string & text,
         return result;
     }
 
-    return ops::synthesize_internal(*this, text, nullptr, params, result,
+    return ops::synthesize_internal(*this, nullptr, text, nullptr, params, result,
                                     &stream_params, &on_audio_chunk);
 }
 
@@ -576,7 +577,7 @@ tts_result Qwen3TTS::synthesize_with_voice_streaming(
         return result;
     }
 
-    return ops::synthesize_internal(*this, text, speaker_embedding.data(), effective_params, result,
+    return ops::synthesize_internal(*this, nullptr, text, speaker_embedding.data(), effective_params, result,
                                     &stream_params, &on_audio_chunk);
 }
 
@@ -607,7 +608,7 @@ tts_result Qwen3TTS::synthesize_with_speaker_embedding_streaming(
     }
 
     result.t_encode_ms = 0;
-    return ops::synthesize_internal(*this, text, speaker_embedding.data(), stream_params.generation, result,
+    return ops::synthesize_internal(*this, nullptr, text, speaker_embedding.data(), stream_params.generation, result,
                                     &stream_params, &on_audio_chunk);
 }
 
@@ -675,6 +676,7 @@ bool Qwen3TTS::extract_speaker_embedding(const std::string & reference_audio,
 }
 
 tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
+                                                       Qwen3TTS::Session * session,
                                                        const std::string & text,
                                                        const float * speaker_embedding,
                                                        const tts_params & params,
@@ -771,7 +773,9 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
             sample_memory("synth/after-transformer-reload");
         }
     }
-    self.transformer_.clear_kv_cache();
+    if (!session) {
+        self.transformer_.clear_kv_cache();
+    }
 
     speech_codes reference_codes;
     const speech_codes * reference_codes_ptr = nullptr;
@@ -854,7 +858,10 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
             return stream.push_frame(frame_codes);
         };
     }
-    if (!self.transformer_.generate(text_tokens.data(), (int32_t) text_tokens.size(),
+    bool generate_ok;
+    if (session && session->transformer_session) {
+        generate_ok = self.transformer_.generate(*session->transformer_session,
+                                    text_tokens.data(), (int32_t) text_tokens.size(),
                                     speaker_embedding, params.max_audio_tokens, generated_codes,
                                     params.language_id, params.repetition_penalty,
                                     params.temperature, params.top_k, params.top_p, params.seed,
@@ -865,7 +872,22 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
                                     reference_codes_ptr ? reference_codes_ptr->codes.data() : nullptr,
                                     reference_codes_ptr ? reference_codes_ptr->n_frames : 0,
                                     reference_codes_ptr ? reference_codes_ptr->n_codebooks : 0,
-                                    streaming ? &frame_callback : nullptr)) {
+                                    streaming ? &frame_callback : nullptr);
+    } else {
+        generate_ok = self.transformer_.generate(text_tokens.data(), (int32_t) text_tokens.size(),
+                                    speaker_embedding, params.max_audio_tokens, generated_codes,
+                                    params.language_id, params.repetition_penalty,
+                                    params.temperature, params.top_k, params.top_p, params.seed,
+                                    instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
+                                    (int32_t) instruct_tokens.size(),
+                                    reference_tokens.empty() ? nullptr : reference_tokens.data(),
+                                    (int32_t) reference_tokens.size(),
+                                    reference_codes_ptr ? reference_codes_ptr->codes.data() : nullptr,
+                                    reference_codes_ptr ? reference_codes_ptr->n_frames : 0,
+                                    reference_codes_ptr ? reference_codes_ptr->n_codebooks : 0,
+                                    streaming ? &frame_callback : nullptr);
+    }
+    if (!generate_ok) {
         result.error_msg = stream_error.empty()
             ? "Failed to generate speech codes: " + self.transformer_.get_error()
             : stream_error;
@@ -1075,6 +1097,334 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
     }
 
     return result;
+}
+
+// ===== Session support =====
+
+Qwen3TTS::Session::~Session() = default;
+
+std::unique_ptr<Qwen3TTS::Session> Qwen3TTS::create_session() {
+    auto s = std::make_unique<Session>();
+    s->transformer_session = transformer_.create_session();
+    if (!s->transformer_session) {
+        return nullptr;
+    }
+    return s;
+}
+
+// ===== Session-aware synthesis wrappers =====
+
+tts_result Qwen3TTS::synthesize(Session & session,
+                                const std::string & text,
+                                const tts_params & params) {
+    tts_result result;
+    if (!models_loaded_) {
+        result.error_msg = "Models not loaded";
+        return result;
+    }
+    if (!params.speaker.empty()) {
+        std::vector<float> speaker_embedding;
+        if (!transformer_.get_named_speaker_embedding(params.speaker, speaker_embedding)) {
+            result.error_msg = "Failed to resolve speaker '" + params.speaker + "': " + transformer_.get_error();
+            return result;
+        }
+        return ops::synthesize_internal(*this, &session, text, speaker_embedding.data(), params, result);
+    }
+    const std::string & model_type = transformer_.get_config().tts_model_type;
+    if (model_type == "custom_voice") {
+        result.error_msg = "CustomVoice model requires --speaker, --reference, or --speaker-embedding";
+        return result;
+    }
+    return ops::synthesize_internal(*this, &session, text, nullptr, params, result);
+}
+
+tts_result Qwen3TTS::synthesize_with_voice(Session & session,
+                                            const std::string & text,
+                                            const float * ref_samples,
+                                            int32_t n_ref_samples,
+                                            const tts_params & params) {
+    tts_result result;
+    if (!models_loaded_) {
+        result.error_msg = "Models not loaded";
+        return result;
+    }
+
+    int64_t t_encode_start = get_time_ms();
+    std::vector<float> speaker_embedding;
+    tts_params effective_params = params;
+    const bool needs_reference_codes =
+        !effective_params.reference_codes.has_value() &&
+        (!effective_params.reference_text.empty() ||
+         !effective_params.reference_token_ids.empty());
+
+    {
+        std::lock_guard<std::mutex> lock(voice_prompt_mutex_);
+        const uint64_t sample_hash = hash_reference_samples(ref_samples, n_ref_samples);
+        const bool cache_hit =
+            voice_prompt_cache_.valid &&
+            voice_prompt_cache_.sample_hash == sample_hash &&
+            voice_prompt_cache_.n_samples == n_ref_samples &&
+            voice_prompt_cache_.reference_text == effective_params.reference_text &&
+            voice_prompt_cache_.reference_token_ids == effective_params.reference_token_ids &&
+            voice_prompt_cache_.has_auto_reference_codes == needs_reference_codes &&
+            (!needs_reference_codes || voice_prompt_cache_.reference_codes.has_value());
+
+        if (cache_hit) {
+            speaker_embedding = voice_prompt_cache_.speaker_embedding;
+            if (needs_reference_codes) {
+                effective_params.reference_codes = voice_prompt_cache_.reference_codes;
+            }
+        } else {
+            if (!encoder_loaded_) {
+                if (speaker_encoder_model_path_.empty()) {
+                    result.error_msg = "Internal error: missing TTS model path for lazy encoder load";
+                    return result;
+                }
+                if (!audio_encoder_.load_model(speaker_encoder_model_path_)) {
+                    result.error_msg = "Failed to load speaker encoder: " + audio_encoder_.get_error();
+                    return result;
+                }
+                encoder_loaded_ = true;
+            }
+            if (!audio_encoder_.encode(ref_samples, n_ref_samples, speaker_embedding)) {
+                result.error_msg = "Failed to extract speaker embedding: " + audio_encoder_.get_error();
+                return result;
+            }
+            if (needs_reference_codes) {
+                if (tokenizer_model_path_.empty()) {
+                    result.error_msg = "Internal error: missing tokenizer model path for speech tokenizer encoder";
+                    return result;
+                }
+                if (!speech_encoder_loaded_) {
+                    if (!speech_encoder_.load_model(tokenizer_model_path_)) {
+                        result.error_msg = "Failed to load speech tokenizer encoder: " + speech_encoder_.get_error();
+                        return result;
+                    }
+                    speech_encoder_loaded_ = true;
+                }
+                speech_codes reference_codes;
+                if (!speech_encoder_.encode(ref_samples, n_ref_samples, reference_codes)) {
+                    result.error_msg = "Failed to tokenize reference audio: " + speech_encoder_.get_error();
+                    return result;
+                }
+                effective_params.reference_codes = std::move(reference_codes);
+            }
+            voice_prompt_cache_.valid = true;
+            voice_prompt_cache_.sample_hash = sample_hash;
+            voice_prompt_cache_.n_samples = n_ref_samples;
+            voice_prompt_cache_.reference_text = effective_params.reference_text;
+            voice_prompt_cache_.reference_token_ids = effective_params.reference_token_ids;
+            voice_prompt_cache_.has_auto_reference_codes = needs_reference_codes;
+            voice_prompt_cache_.speaker_embedding = speaker_embedding;
+            voice_prompt_cache_.reference_codes = needs_reference_codes
+                ? effective_params.reference_codes
+                : std::optional<speech_codes>();
+        }
+    }
+    result.t_encode_ms = get_time_ms() - t_encode_start;
+
+    const int expected_dim = transformer_.get_config().hidden_size;
+    if ((int) speaker_embedding.size() != expected_dim) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "Speaker embedding dimension mismatch after extraction: got %zu, expected %d",
+                 speaker_embedding.size(), expected_dim);
+        result.error_msg = buf;
+        return result;
+    }
+
+    return ops::synthesize_internal(*this, &session, text, speaker_embedding.data(), effective_params, result);
+}
+
+tts_result Qwen3TTS::synthesize_streaming(
+    Session & session,
+    const std::string & text,
+    const tts_audio_chunk_callback_t & on_audio_chunk,
+    const tts_streaming_params & stream_params) {
+    tts_result result;
+    const tts_params & params = stream_params.generation;
+    if (!on_audio_chunk) {
+        result.error_msg = "Streaming audio callback is not set";
+        return result;
+    }
+    if (!models_loaded_) {
+        result.error_msg = "Models not loaded";
+        return result;
+    }
+    if (!params.speaker.empty()) {
+        std::vector<float> speaker_embedding;
+        if (!transformer_.get_named_speaker_embedding(params.speaker, speaker_embedding)) {
+            result.error_msg = "Failed to resolve speaker '" + params.speaker + "': " + transformer_.get_error();
+            return result;
+        }
+        return ops::synthesize_internal(*this, &session, text, speaker_embedding.data(), params, result,
+                                        &stream_params, &on_audio_chunk);
+    }
+    const std::string & model_type = transformer_.get_config().tts_model_type;
+    if (model_type == "custom_voice") {
+        result.error_msg = "CustomVoice model requires --speaker, --reference, or --speaker-embedding";
+        return result;
+    }
+    return ops::synthesize_internal(*this, &session, text, nullptr, params, result,
+                                    &stream_params, &on_audio_chunk);
+}
+
+tts_result Qwen3TTS::synthesize_with_voice_streaming(
+    Session & session,
+    const std::string & text,
+    const std::string & reference_audio,
+    const tts_audio_chunk_callback_t & on_audio_chunk,
+    const tts_streaming_params & stream_params) {
+    tts_result result;
+    std::vector<float> ref_samples;
+    int ref_sample_rate;
+    if (!load_audio_file(reference_audio, ref_samples, ref_sample_rate)) {
+        result.error_msg = "Failed to load reference audio: " + reference_audio;
+        return result;
+    }
+    const int target_rate = 24000;
+    if (ref_sample_rate != target_rate) {
+        std::vector<float> resampled;
+        resample_linear(ref_samples.data(), (int) ref_samples.size(), ref_sample_rate, resampled, target_rate);
+        ref_samples = std::move(resampled);
+    }
+    return synthesize_with_voice_streaming(session, text, ref_samples.data(), (int32_t) ref_samples.size(),
+                                           on_audio_chunk, stream_params);
+}
+
+tts_result Qwen3TTS::synthesize_with_voice_streaming(
+    Session & session,
+    const std::string & text,
+    const float * ref_samples,
+    int32_t n_ref_samples,
+    const tts_audio_chunk_callback_t & on_audio_chunk,
+    const tts_streaming_params & stream_params) {
+    tts_result result;
+    const tts_params & params = stream_params.generation;
+    if (!on_audio_chunk) {
+        result.error_msg = "Streaming audio callback is not set";
+        return result;
+    }
+    if (!models_loaded_) {
+        result.error_msg = "Models not loaded";
+        return result;
+    }
+
+    int64_t t_encode_start = get_time_ms();
+    std::vector<float> speaker_embedding;
+    tts_params effective_params = params;
+    const bool needs_reference_codes =
+        !effective_params.reference_codes.has_value() &&
+        (!effective_params.reference_text.empty() ||
+         !effective_params.reference_token_ids.empty());
+
+    {
+        std::lock_guard<std::mutex> lock(voice_prompt_mutex_);
+        const uint64_t sample_hash = hash_reference_samples(ref_samples, n_ref_samples);
+        const bool cache_hit =
+            voice_prompt_cache_.valid &&
+            voice_prompt_cache_.sample_hash == sample_hash &&
+            voice_prompt_cache_.n_samples == n_ref_samples &&
+            voice_prompt_cache_.reference_text == effective_params.reference_text &&
+            voice_prompt_cache_.reference_token_ids == effective_params.reference_token_ids &&
+            voice_prompt_cache_.has_auto_reference_codes == needs_reference_codes &&
+            (!needs_reference_codes || voice_prompt_cache_.reference_codes.has_value());
+
+        if (cache_hit) {
+            speaker_embedding = voice_prompt_cache_.speaker_embedding;
+            if (needs_reference_codes) {
+                effective_params.reference_codes = voice_prompt_cache_.reference_codes;
+            }
+        } else {
+            if (!encoder_loaded_) {
+                if (speaker_encoder_model_path_.empty()) {
+                    result.error_msg = "Internal error: missing TTS model path for lazy encoder load";
+                    return result;
+                }
+                if (!audio_encoder_.load_model(speaker_encoder_model_path_)) {
+                    result.error_msg = "Failed to load speaker encoder: " + audio_encoder_.get_error();
+                    return result;
+                }
+                encoder_loaded_ = true;
+            }
+            if (!audio_encoder_.encode(ref_samples, n_ref_samples, speaker_embedding)) {
+                result.error_msg = "Failed to extract speaker embedding: " + audio_encoder_.get_error();
+                return result;
+            }
+            if (needs_reference_codes) {
+                if (tokenizer_model_path_.empty()) {
+                    result.error_msg = "Internal error: missing tokenizer model path for speech tokenizer encoder";
+                    return result;
+                }
+                if (!speech_encoder_loaded_) {
+                    if (!speech_encoder_.load_model(tokenizer_model_path_)) {
+                        result.error_msg = "Failed to load speech tokenizer encoder: " + speech_encoder_.get_error();
+                        return result;
+                    }
+                    speech_encoder_loaded_ = true;
+                }
+                speech_codes reference_codes;
+                if (!speech_encoder_.encode(ref_samples, n_ref_samples, reference_codes)) {
+                    result.error_msg = "Failed to tokenize reference audio: " + speech_encoder_.get_error();
+                    return result;
+                }
+                effective_params.reference_codes = std::move(reference_codes);
+            }
+            voice_prompt_cache_.valid = true;
+            voice_prompt_cache_.sample_hash = sample_hash;
+            voice_prompt_cache_.n_samples = n_ref_samples;
+            voice_prompt_cache_.reference_text = effective_params.reference_text;
+            voice_prompt_cache_.reference_token_ids = effective_params.reference_token_ids;
+            voice_prompt_cache_.has_auto_reference_codes = needs_reference_codes;
+            voice_prompt_cache_.speaker_embedding = speaker_embedding;
+            voice_prompt_cache_.reference_codes = needs_reference_codes
+                ? effective_params.reference_codes
+                : std::optional<speech_codes>();
+        }
+    }
+    result.t_encode_ms = get_time_ms() - t_encode_start;
+
+    const int expected_dim = transformer_.get_config().hidden_size;
+    if ((int) speaker_embedding.size() != expected_dim) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "Speaker embedding dimension mismatch after extraction: got %zu, expected %d",
+                 speaker_embedding.size(), expected_dim);
+        result.error_msg = buf;
+        return result;
+    }
+
+    return ops::synthesize_internal(*this, &session, text, speaker_embedding.data(), effective_params, result,
+                                    &stream_params, &on_audio_chunk);
+}
+
+tts_result Qwen3TTS::synthesize_with_speaker_embedding_streaming(
+    Session & session,
+    const std::string & text,
+    const std::vector<float> & speaker_embedding,
+    const tts_audio_chunk_callback_t & on_audio_chunk,
+    const tts_streaming_params & stream_params) {
+    tts_result result;
+    if (!on_audio_chunk) {
+        result.error_msg = "Streaming audio callback is not set";
+        return result;
+    }
+    if (!models_loaded_) {
+        result.error_msg = "Models not loaded";
+        return result;
+    }
+    const int expected_dim = transformer_.get_config().hidden_size;
+    if ((int) speaker_embedding.size() != expected_dim) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "Speaker embedding dimension mismatch: got %zu, expected %d",
+                 speaker_embedding.size(), expected_dim);
+        result.error_msg = buf;
+        return result;
+    }
+    result.t_encode_ms = 0;
+    return ops::synthesize_internal(*this, &session, text, speaker_embedding.data(), stream_params.generation, result,
+                                    &stream_params, &on_audio_chunk);
 }
 
 } // namespace qwen3_tts

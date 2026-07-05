@@ -1,5 +1,7 @@
 #include "qwen3_tts_c.h"
 #include "qwen3_tts.h"
+#include "pipeline/pipeline_internal.h"
+#include "transformer/transformer_state_internal.h"
 #include "sensevoice_asr.h"
 #include "paraformer_asr.h"
 #include "funasr_vad.h"
@@ -30,6 +32,10 @@ struct qwen3_tts_context {
     // Cached VAD model
     std::string cached_vad_path;
     std::unique_ptr<funasr_vad_impl::vad> cached_vad;
+};
+
+struct qwen3_tts_session {
+    std::unique_ptr<qwen3_tts::Qwen3TTS::Session> session;
 };
 
 static int32_t to_model_kind(const std::string & model_type) {
@@ -755,5 +761,125 @@ qwen3_asr_result_t qwen3_asr_transcribe_pcm(
     }
 
     return convert_asr_result(result);
+}
+
+// ===== Session API =====
+
+qwen3_tts_session_t* qwen3_tts_session_create(qwen3_tts_context_t* ctx) {
+    if (!ctx) return nullptr;
+    auto s = new (std::nothrow) qwen3_tts_session();
+    if (!s) return nullptr;
+    s->session = ctx->tts.create_session();
+    if (!s->session) {
+        delete s;
+        return nullptr;
+    }
+    return s;
+}
+
+void qwen3_tts_session_free(qwen3_tts_session_t* session) {
+    delete session;
+}
+
+qwen3_tts_result_t qwen3_tts_session_synthesize(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    qwen3_tts_params_t params
+) {
+    if (!ctx || !session || !session->session || !text) {
+        qwen3_tts_result_t res;
+        std::memset(&res, 0, sizeof(res));
+        res.error_msg = strdup("Invalid context, session, or text");
+        return res;
+    }
+    auto result = ctx->tts.synthesize(*session->session, text, convert_params(params));
+    return convert_result(result);
+}
+
+qwen3_tts_result_t qwen3_tts_session_synthesize_with_voice(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    const char* reference_audio,
+    const char* reference_text,
+    qwen3_tts_params_t params
+) {
+    if (!ctx || !session || !session->session || !text || !reference_audio) {
+        qwen3_tts_result_t res;
+        std::memset(&res, 0, sizeof(res));
+        res.error_msg = strdup("Invalid context, session, text, or reference audio");
+        return res;
+    }
+    std::vector<float> ref_samples;
+    int ref_sample_rate;
+    if (!qwen3_tts::load_audio_file(reference_audio, ref_samples, ref_sample_rate)) {
+        qwen3_tts_result_t res;
+        std::memset(&res, 0, sizeof(res));
+        res.error_msg = strdup("Failed to load reference audio");
+        return res;
+    }
+    const int target_rate = 24000;
+    if (ref_sample_rate != target_rate) {
+        std::vector<float> resampled;
+        qwen3_tts::pipeline_internal::resample_linear(ref_samples.data(), (int)ref_samples.size(), ref_sample_rate, resampled, target_rate);
+        ref_samples = std::move(resampled);
+    }
+    auto p = convert_params(params);
+    if (reference_text) {
+        p.reference_text = reference_text;
+    }
+    auto result = ctx->tts.synthesize_with_voice(*session->session, text, ref_samples.data(), (int32_t)ref_samples.size(), p);
+    return convert_result(result);
+}
+
+qwen3_tts_result_t qwen3_tts_session_synthesize_streaming(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    qwen3_tts_streaming_params_t params,
+    qwen3_tts_audio_chunk_callback callback,
+    void* user_data
+) {
+    if (!ctx || !session || !session->session || !text || !callback) {
+        qwen3_tts_result_t res;
+        std::memset(&res, 0, sizeof(res));
+        res.error_msg = strdup("Invalid context, session, text, or streaming callback");
+        return res;
+    }
+    qwen3_tts::tts_audio_chunk_callback_t cb =
+        [callback, user_data](const float* samples, int32_t n_samples, int32_t sample_rate) {
+            return callback(samples, n_samples, sample_rate, user_data) != 0;
+        };
+    auto result = ctx->tts.synthesize_streaming(*session->session, text, cb, convert_streaming_params(params));
+    return convert_result(result);
+}
+
+qwen3_tts_result_t qwen3_tts_session_synthesize_with_voice_streaming(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    const char* reference_audio,
+    const char* reference_text,
+    qwen3_tts_streaming_params_t params,
+    qwen3_tts_audio_chunk_callback callback,
+    void* user_data
+) {
+    if (!ctx || !session || !session->session || !text || !reference_audio || !callback) {
+        qwen3_tts_result_t res;
+        std::memset(&res, 0, sizeof(res));
+        res.error_msg = strdup("Invalid context, session, text, reference audio, or callback");
+        return res;
+    }
+    qwen3_tts::tts_audio_chunk_callback_t cb =
+        [callback, user_data](const float* samples, int32_t n_samples, int32_t sample_rate) {
+            return callback(samples, n_samples, sample_rate, user_data) != 0;
+        };
+    auto sp = convert_streaming_params(params);
+    if (reference_text) {
+        sp.generation.reference_text = reference_text;
+    }
+    auto result = ctx->tts.synthesize_with_voice_streaming(*session->session, text, reference_audio, cb, sp);
+    return convert_result(result);
 }
 

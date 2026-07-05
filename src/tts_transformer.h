@@ -13,6 +13,7 @@ struct gguf_context;
 
 namespace qwen3_tts {
 struct tts_transformer_private;
+class TTSTransformerSession;
 namespace transformer_internal {
 struct ops;
 }
@@ -95,16 +96,20 @@ public:
     
     // Initialize KV cache
     bool init_kv_cache(int32_t n_ctx);
-    
+    bool init_kv_cache(TTSTransformerSession & session, int32_t n_ctx);
+
     // Clear KV cache
     void clear_kv_cache();
-    
+    void clear_kv_cache(TTSTransformerSession & session);
+
     // Initialize code predictor KV cache (5 layers, max 16 context)
     bool init_code_pred_kv_cache(int32_t n_ctx);
-    
+    bool init_code_pred_kv_cache(TTSTransformerSession & session, int32_t n_ctx);
+
     // Clear code predictor KV cache
     void clear_code_pred_kv_cache();
-    
+    void clear_code_pred_kv_cache(TTSTransformerSession & session);
+
     // Forward pass for text tokens (prefill phase)
     // text_tokens: input text token IDs [n_tokens]
     // speaker_embd: speaker embedding [hidden_size] (optional, can be nullptr)
@@ -113,37 +118,65 @@ public:
     bool forward_text(const int32_t * text_tokens, int32_t n_tokens,
                       const float * speaker_embd, int32_t n_past,
                       std::vector<float> & output);
+    bool forward_text(TTSTransformerSession & session,
+                      const int32_t * text_tokens, int32_t n_tokens,
+                      const float * speaker_embd, int32_t n_past,
+                      std::vector<float> & output);
 
     bool forward_prefill(const float * prefill_embd, int32_t n_tokens,
                          int32_t n_past, std::vector<float> & output,
                          std::vector<float> * logits_out = nullptr);
-    
+    bool forward_prefill(TTSTransformerSession & session,
+                         const float * prefill_embd, int32_t n_tokens,
+                         int32_t n_past, std::vector<float> & output,
+                         std::vector<float> * logits_out = nullptr);
+
     // Forward pass for codec tokens (generation phase)
     // codec_token: single codec token for first codebook
     // n_past: number of tokens already in KV cache
     // output: logits for next codec token [codec_vocab_size]
     bool forward_codec(int32_t codec_token, int32_t n_past,
                        std::vector<float> & output);
+    bool forward_codec(TTSTransformerSession & session,
+                       int32_t codec_token, int32_t n_past,
+                       std::vector<float> & output);
 
     bool forward_step(const float * step_embd, int32_t n_past,
                       std::vector<float> & output,
                       std::vector<float> * hidden_out = nullptr);
-    
+    bool forward_step(TTSTransformerSession & session,
+                      const float * step_embd, int32_t n_past,
+                      std::vector<float> & output,
+                      std::vector<float> * hidden_out = nullptr);
+
     // Get hidden states from last forward pass (for code predictor)
     bool get_hidden_states(std::vector<float> & hidden) const;
-    
+    bool get_hidden_states(TTSTransformerSession & session, std::vector<float> & hidden) const;
+
     // Run code predictor to get all 16 codebook predictions
     // hidden: hidden states from talker [hidden_size]
     // prev_codes: previous codes for codebooks 1-15 (can be nullptr for first step)
     // output: logits for all 16 codebooks [16, code_pred_vocab_size]
     bool predict_codes(const float * hidden, const int32_t * prev_codes,
                        std::vector<float> & output);
-    
+    bool predict_codes(TTSTransformerSession & session,
+                       const float * hidden, const int32_t * prev_codes,
+                       std::vector<float> & output);
+
     // Run code predictor autoregressively to generate 15 codes (codebooks 1-15)
     // hidden: hidden states from talker [hidden_size]
     // codebook_0_token: the codebook 0 token (used to create 2-token prefill input)
     // output: generated codes for codebooks 1-15 [15]
-    bool predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token, 
+    bool predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token,
+                                       std::vector<int32_t> & output,
+                                       float temperature = 0.9f,
+                                       int32_t top_k = 50,
+                                       float top_p = 1.0f,
+                                       int64_t seed = -1,
+                                       int64_t * sampling_subseq = nullptr,
+                                       int32_t trace_frame = -1);
+    bool predict_codes_autoregressive(TTSTransformerSession & session,
+                                       const float * hidden, int32_t codebook_0_token,
                                        std::vector<int32_t> & output,
                                        float temperature = 0.9f,
                                        int32_t top_k = 50,
@@ -174,6 +207,31 @@ public:
                   int32_t n_reference_frames = 0,
                   int32_t n_reference_codebooks = 0,
                   const tts_code_frame_callback_t * frame_callback = nullptr);
+
+    // Session-aware generate: use a dedicated session for thread-safe concurrent inference.
+    bool generate(TTSTransformerSession & session,
+                  const int32_t * text_tokens, int32_t n_tokens,
+                  const float * speaker_embd, int32_t max_len,
+                  std::vector<int32_t> & output,
+                  int32_t language_id = 2050,
+                  float repetition_penalty = 1.05f,
+                  float temperature = 0.9f,
+                  int32_t top_k = 50,
+                  float top_p = 1.0f,
+                  int64_t seed = -1,
+                  const int32_t * instruct_tokens = nullptr,
+                  int32_t n_instruct_tokens = 0,
+                  const int32_t * reference_tokens = nullptr,
+                  int32_t n_reference_tokens = 0,
+                  const int32_t * reference_codes = nullptr,
+                  int32_t n_reference_frames = 0,
+                  int32_t n_reference_codebooks = 0,
+                  const tts_code_frame_callback_t * frame_callback = nullptr);
+
+    // Create a new session for concurrent inference.
+    // Each session has its own scheduler, KV caches, and scratch buffers.
+    // Multiple sessions can share the same model weights safely.
+    std::unique_ptr<TTSTransformerSession> create_session();
     
     const tts_transformer_config & get_config() const;
     
@@ -196,9 +254,12 @@ private:
     friend struct transformer_internal::ops;
 
     std::unique_ptr<tts_transformer_private> impl_;
+    std::unique_ptr<TTSTransformerSession> default_session_;
     std::string error_msg_;
-    
-    // Cached hidden states from last forward pass
+
+    void ensure_default_session();
+
+    // Cached hidden states from last forward pass (backward-compat, non-session path)
     std::vector<float> last_hidden_;
 };
 

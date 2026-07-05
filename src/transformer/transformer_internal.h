@@ -11,6 +11,7 @@ struct gguf_context;
 
 namespace qwen3_tts {
 class TTSTransformer;
+class TTSTransformerSession;
 namespace transformer_internal {
 
 struct debug_trace_config {
@@ -23,6 +24,7 @@ struct debug_trace_config {
 struct ops {
     static bool try_init_coreml_code_predictor(TTSTransformer & self, const std::string & model_path);
     static bool predict_codes_autoregressive_coreml(TTSTransformer & self,
+                                                    TTSTransformerSession & session,
                                                     const float * hidden,
                                                     int32_t codebook_0_token,
                                                     std::vector<int32_t> & output,
@@ -34,6 +36,7 @@ struct ops {
                                                     int32_t trace_frame);
 
     static bool build_prefill_graph(TTSTransformer & self,
+                                    TTSTransformerSession & session,
                                     const int32_t * text_tokens,
                                     int32_t n_tokens,
                                     const float * speaker_embd,
@@ -49,13 +52,19 @@ struct ops {
                                     int32_t n_reference_frames = 0,
                                     int32_t n_reference_codebooks = 0);
 
-    static struct ggml_cgraph * build_prefill_forward_graph(TTSTransformer & self, int32_t n_tokens, int32_t n_past);
-    static struct ggml_cgraph * build_step_graph(TTSTransformer & self, int32_t n_past);
+    static struct ggml_cgraph * build_prefill_forward_graph(TTSTransformer & self,
+                                                            TTSTransformerSession & session,
+                                                            int32_t n_tokens, int32_t n_past);
+    static struct ggml_cgraph * build_step_graph(TTSTransformer & self,
+                                                  TTSTransformerSession & session,
+                                                  int32_t n_past);
     static bool project_text_tokens(TTSTransformer & self,
+                                    TTSTransformerSession & session,
                                     const int32_t * text_tokens,
                                     int32_t n_tokens,
                                     std::vector<float> & output);
     static bool lookup_embedding_rows(TTSTransformer & self,
+                                      TTSTransformerSession & session,
                                       struct ggml_tensor * embedding,
                                       const int32_t * token_ids,
                                       int32_t n_tokens,
@@ -63,13 +72,21 @@ struct ops {
                                       const char * output_name,
                                       std::vector<float> & output);
     static bool lookup_single_embedding_row(TTSTransformer & self,
+                                            TTSTransformerSession & session,
                                             struct ggml_tensor * embedding,
                                             int32_t token_id,
                                             float * out_row);
-    static struct ggml_cgraph * build_code_pred_graph(TTSTransformer & self, int32_t n_prev_codes);
-    static struct ggml_cgraph * build_code_pred_step_graph(TTSTransformer & self, int32_t n_past, int32_t generation_step);
-    static struct ggml_cgraph * build_code_pred_prefill_graph(TTSTransformer & self);
-    static void maybe_reserve_scheduler_graphs(TTSTransformer & self, int32_t prefill_len, int32_t required_ctx);
+    static struct ggml_cgraph * build_code_pred_graph(TTSTransformer & self,
+                                                       TTSTransformerSession & session,
+                                                       int32_t n_prev_codes);
+    static struct ggml_cgraph * build_code_pred_step_graph(TTSTransformer & self,
+                                                            TTSTransformerSession & session,
+                                                            int32_t n_past, int32_t generation_step);
+    static struct ggml_cgraph * build_code_pred_prefill_graph(TTSTransformer & self,
+                                                               TTSTransformerSession & session);
+    static void maybe_reserve_scheduler_graphs(TTSTransformer & self,
+                                                TTSTransformerSession & session,
+                                                int32_t prefill_len, int32_t required_ctx);
     static bool parse_config(TTSTransformer & self, struct gguf_context * ctx);
     static bool create_tensors(TTSTransformer & self, struct gguf_context * ctx);
     static bool load_tensor_data(TTSTransformer & self, const std::string & path, struct gguf_context * ctx);

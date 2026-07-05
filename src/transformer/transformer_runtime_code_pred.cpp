@@ -12,15 +12,20 @@
 
 namespace qwen3_tts {
 
-bool TTSTransformer::get_hidden_states(std::vector<float> & hidden) const {
-    if (last_hidden_.empty()) {
+// ---------------------------------------------------------------------------
+// Session-aware primary implementations
+// ---------------------------------------------------------------------------
+
+bool TTSTransformer::get_hidden_states(TTSTransformerSession & session, std::vector<float> & hidden) const {
+    if (session.last_hidden_.empty()) {
         return false;
     }
-    hidden = last_hidden_;
+    hidden = session.last_hidden_;
     return true;
 }
 
-bool TTSTransformer::predict_codes(const float * hidden, const int32_t * prev_codes,
+bool TTSTransformer::predict_codes(TTSTransformerSession & session,
+                                   const float * hidden, const int32_t * prev_codes,
                                    std::vector<float> & output) {
     if (!impl_->model.ctx) {
         error_msg_ = "Model not loaded";
@@ -30,9 +35,9 @@ bool TTSTransformer::predict_codes(const float * hidden, const int32_t * prev_co
     const auto & cfg = impl_->model.config;
     int n_prev = (prev_codes != nullptr) ? cfg.n_codebooks - 1 : 0;
 
-    struct ggml_cgraph * gf = transformer_internal::ops::build_code_pred_graph(*this, n_prev);
+    struct ggml_cgraph * gf = transformer_internal::ops::build_code_pred_graph(*this, session, n_prev);
 
-    if (!ggml_backend_sched_alloc_graph(impl_->state.sched, gf)) {
+    if (!ggml_backend_sched_alloc_graph(session.state_.sched, gf)) {
         error_msg_ = "Failed to allocate code predictor graph";
         return false;
     }
@@ -49,9 +54,9 @@ bool TTSTransformer::predict_codes(const float * hidden, const int32_t * prev_co
         }
     }
 
-    if (ggml_backend_sched_graph_compute(impl_->state.sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(session.state_.sched, gf) != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute code predictor graph";
-        ggml_backend_sched_reset(impl_->state.sched);
+        ggml_backend_sched_reset(session.state_.sched);
         return false;
     }
 
@@ -67,12 +72,13 @@ bool TTSTransformer::predict_codes(const float * hidden, const int32_t * prev_co
         }
     }
 
-    ggml_backend_sched_reset(impl_->state.sched);
+    ggml_backend_sched_reset(session.state_.sched);
 
     return true;
 }
 
 bool transformer_internal::ops::predict_codes_autoregressive_coreml(TTSTransformer & self,
+                                                                    TTSTransformerSession & session,
                                                                     const float * hidden,
                                                                     int32_t codebook_0_token,
                                                                     std::vector<int32_t> & output,
@@ -112,7 +118,7 @@ bool transformer_internal::ops::predict_codes_autoregressive_coreml(TTSTransform
     };
 
     memcpy(seq_embd.data(), hidden, (size_t) cfg.hidden_size * sizeof(float));
-    if (!lookup_single_embedding_row(self, impl->model.codec_embd, codebook_0_token,
+    if (!lookup_single_embedding_row(self, session, impl->model.codec_embd, codebook_0_token,
                                      seq_embd.data() + cfg.hidden_size)) {
         return false;
     }
@@ -132,7 +138,7 @@ bool transformer_internal::ops::predict_codes_autoregressive_coreml(TTSTransform
     for (int32_t step = 0; step < n_steps; ++step) {
         if (step > 0) {
             float * dst = seq_embd.data() + (size_t) (step + 1) * cfg.hidden_size;
-            if (!lookup_single_embedding_row(self, impl->model.code_pred_embd[step - 1], output[step - 1], dst)) {
+            if (!lookup_single_embedding_row(self, session, impl->model.code_pred_embd[step - 1], output[step - 1], dst)) {
                 return false;
             }
         }
@@ -192,7 +198,8 @@ bool transformer_internal::ops::predict_codes_autoregressive_coreml(TTSTransform
     return true;
 }
 
-bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token,
+bool TTSTransformer::predict_codes_autoregressive(TTSTransformerSession & session,
+                                                  const float * hidden, int32_t codebook_0_token,
                                                   std::vector<int32_t> & output,
                                                   float temperature, int32_t top_k,
                                                   float top_p,
@@ -214,7 +221,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #endif
 
     if (impl_->use_coreml_code_predictor && impl_->coreml_code_predictor.is_loaded()) {
-        if (transformer_internal::ops::predict_codes_autoregressive_coreml(*this, hidden, codebook_0_token, output, temperature, top_k, top_p, seed, sampling_subseq, trace_frame)) {
+        if (transformer_internal::ops::predict_codes_autoregressive_coreml(*this, session, hidden, codebook_0_token, output, temperature, top_k, top_p, seed, sampling_subseq, trace_frame)) {
             return true;
         }
         if (impl_->skip_ggml_code_pred_layers) {
@@ -224,12 +231,12 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         impl_->use_coreml_code_predictor = false;
     }
 
-    if (impl_->state.code_pred_cache.n_ctx < 16) {
-        if (!init_code_pred_kv_cache(16)) {
+    if (session.state_.code_pred_cache.n_ctx < 16) {
+        if (!init_code_pred_kv_cache(session, 16)) {
             return false;
         }
     }
-    clear_code_pred_kv_cache();
+    clear_code_pred_kv_cache(session);
 
     output.resize(15);
     std::vector<float> logits_data(cfg.code_pred_vocab_size);
@@ -243,7 +250,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     };
 
     std::vector<float> cb0_embd(cfg.hidden_size);
-    if (!transformer_internal::ops::lookup_single_embedding_row(*this, impl_->model.codec_embd, codebook_0_token, cb0_embd.data())) {
+    if (!transformer_internal::ops::lookup_single_embedding_row(*this, session, impl_->model.codec_embd, codebook_0_token, cb0_embd.data())) {
         return false;
     }
     if (trace_frame_enabled) {
@@ -274,7 +281,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        struct ggml_cgraph * gf = transformer_internal::ops::build_code_pred_prefill_graph(*this);
+        struct ggml_cgraph * gf = transformer_internal::ops::build_code_pred_prefill_graph(*this, session);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (impl_->timing) impl_->timing->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -283,7 +290,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (!ggml_backend_sched_alloc_graph(impl_->state.sched, gf)) {
+        if (!ggml_backend_sched_alloc_graph(session.state_.sched, gf)) {
             error_msg_ = "Failed to allocate code predictor prefill graph";
             return false;
         }
@@ -335,9 +342,9 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (ggml_backend_sched_graph_compute(impl_->state.sched, gf) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_sched_graph_compute(session.state_.sched, gf) != GGML_STATUS_SUCCESS) {
             error_msg_ = "Failed to compute code predictor prefill graph";
-            ggml_backend_sched_reset(impl_->state.sched);
+            ggml_backend_sched_reset(session.state_.sched);
             return false;
         }
 #ifdef QWEN3_TTS_TIMING
@@ -348,7 +355,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
         if (!logits) {
             error_msg_ = "Failed to find logits tensor in prefill";
-            ggml_backend_sched_reset(impl_->state.sched);
+            ggml_backend_sched_reset(session.state_.sched);
             return false;
         }
 
@@ -369,7 +376,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 
         output[0] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
 
-        ggml_backend_sched_reset(impl_->state.sched);
+        ggml_backend_sched_reset(session.state_.sched);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (impl_->timing) impl_->timing->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -380,25 +387,25 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
     auto t_steps_start = clk::now();
 #endif
-    if (impl_->state.code_pred_mask.size() != (size_t) impl_->state.code_pred_cache.n_ctx) {
-        impl_->state.code_pred_mask.resize((size_t) impl_->state.code_pred_cache.n_ctx);
+    if (session.state_.code_pred_mask.size() != (size_t) session.state_.code_pred_cache.n_ctx) {
+        session.state_.code_pred_mask.resize((size_t) session.state_.code_pred_cache.n_ctx);
     }
-    std::fill(impl_->state.code_pred_mask.begin(), impl_->state.code_pred_mask.end(), ggml_fp32_to_fp16(-INFINITY));
+    std::fill(session.state_.code_pred_mask.begin(), session.state_.code_pred_mask.end(), ggml_fp32_to_fp16(-INFINITY));
     const ggml_fp16_t zero_fp16 = ggml_fp32_to_fp16(0.0f);
-    for (int i = 0; i <= 2 && i < impl_->state.code_pred_cache.n_ctx; ++i) {
-        impl_->state.code_pred_mask[(size_t) i] = zero_fp16;
+    for (int i = 0; i <= 2 && i < session.state_.code_pred_cache.n_ctx; ++i) {
+        session.state_.code_pred_mask[(size_t) i] = zero_fp16;
     }
 
     for (int step = 1; step < 15; ++step) {
         int32_t n_past = step + 1;
-        if (n_past < impl_->state.code_pred_cache.n_ctx) {
-            impl_->state.code_pred_mask[(size_t) n_past] = zero_fp16;
+        if (n_past < session.state_.code_pred_cache.n_ctx) {
+            session.state_.code_pred_mask[(size_t) n_past] = zero_fp16;
         }
 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        struct ggml_cgraph * gf = transformer_internal::ops::build_code_pred_step_graph(*this, n_past, step);
+        struct ggml_cgraph * gf = transformer_internal::ops::build_code_pred_step_graph(*this, session, n_past, step);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (impl_->timing) impl_->timing->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -407,7 +414,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (!ggml_backend_sched_alloc_graph(impl_->state.sched, gf)) {
+        if (!ggml_backend_sched_alloc_graph(session.state_.sched, gf)) {
             error_msg_ = "Failed to allocate code predictor step graph";
             return false;
         }
@@ -445,7 +452,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
         if (inp_mask) {
             const size_t mask_size = (size_t) n_past + 1;
-            ggml_backend_tensor_set(inp_mask, impl_->state.code_pred_mask.data(), 0,
+            ggml_backend_tensor_set(inp_mask, session.state_.code_pred_mask.data(), 0,
                                     mask_size * sizeof(ggml_fp16_t));
         }
 #ifdef QWEN3_TTS_TIMING
@@ -456,9 +463,9 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (ggml_backend_sched_graph_compute(impl_->state.sched, gf) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_sched_graph_compute(session.state_.sched, gf) != GGML_STATUS_SUCCESS) {
             error_msg_ = "Failed to compute code predictor step graph";
-            ggml_backend_sched_reset(impl_->state.sched);
+            ggml_backend_sched_reset(session.state_.sched);
             return false;
         }
 #ifdef QWEN3_TTS_TIMING
@@ -469,7 +476,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
         if (!logits) {
             error_msg_ = "Failed to find logits tensor";
-            ggml_backend_sched_reset(impl_->state.sched);
+            ggml_backend_sched_reset(session.state_.sched);
             return false;
         }
 
@@ -490,7 +497,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 
         output[step] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
 
-        ggml_backend_sched_reset(impl_->state.sched);
+        ggml_backend_sched_reset(session.state_.sched);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (impl_->timing) impl_->timing->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -512,6 +519,36 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         *sampling_subseq = sampling.subseq;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Backward-compat wrappers (delegate to default session)
+// ---------------------------------------------------------------------------
+
+bool TTSTransformer::get_hidden_states(std::vector<float> & hidden) const {
+    if (last_hidden_.empty()) {
+        return false;
+    }
+    hidden = last_hidden_;
+    return true;
+}
+
+bool TTSTransformer::predict_codes(const float * hidden, const int32_t * prev_codes,
+                                   std::vector<float> & output) {
+    ensure_default_session();
+    return predict_codes(*default_session_, hidden, prev_codes, output);
+}
+
+bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token,
+                                                  std::vector<int32_t> & output,
+                                                  float temperature, int32_t top_k,
+                                                  float top_p,
+                                                  int64_t seed,
+                                                  int64_t * sampling_subseq,
+                                                  int32_t trace_frame) {
+    ensure_default_session();
+    return predict_codes_autoregressive(*default_session_, hidden, codebook_0_token, output,
+                                        temperature, top_k, top_p, seed, sampling_subseq, trace_frame);
 }
 
 } // namespace qwen3_tts

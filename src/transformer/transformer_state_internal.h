@@ -131,7 +131,6 @@ struct tts_transformer_state {
 struct tts_transformer_private {
     tts_transformer_model model;
     tts_transformer_state state;
-    std::vector<ggml_fp16_t> embd_row_fp16_scratch;
     CoreMLCodePredictor coreml_code_predictor;
     bool use_coreml_code_predictor = false;
     std::string coreml_code_predictor_path;
@@ -139,6 +138,28 @@ struct tts_transformer_private {
 
 #ifdef QWEN3_TTS_TIMING
     tts_timing * timing = nullptr;
+#endif
+};
+
+class TTSTransformerSession {
+public:
+    TTSTransformerSession();
+    ~TTSTransformerSession();
+
+    TTSTransformerSession(const TTSTransformerSession &) = delete;
+    TTSTransformerSession & operator=(const TTSTransformerSession &) = delete;
+
+    bool is_initialized() const { return initialized_; }
+
+    tts_transformer_state state_;
+    std::vector<float> last_hidden_;
+    std::vector<ggml_fp16_t> embd_row_fp16_scratch_;
+    std::string error_msg_;
+    bool initialized_ = false;
+    bool own_backend_ = false;
+
+#ifdef QWEN3_TTS_TIMING
+    tts_timing timing_ = {};
 #endif
 };
 

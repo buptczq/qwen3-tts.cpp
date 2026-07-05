@@ -106,6 +106,7 @@ set(TTS_TRANSFORMER_SOURCES
     src/transformer/transformer_runtime.cpp
     src/transformer/transformer_runtime_code_pred.cpp
     src/transformer/transformer_generate.cpp
+    src/transformer/transformer_session.cpp
 )
 if(APPLE AND QWEN3_TTS_COREML)
     list(APPEND TTS_TRANSFORMER_SOURCES src/coreml_code_predictor.mm)
@@ -289,6 +290,15 @@ add_executable(test_transformer
     tests/test_transformer.cpp
 )
 target_link_libraries(test_transformer PRIVATE
+    tts_transformer
+    Threads::Threads
+)
+
+# Test executable for multi-session concurrent inference
+add_executable(test_multi_session
+    tests/test_multi_session.cpp
+)
+target_link_libraries(test_multi_session PRIVATE
     tts_transformer
     Threads::Threads
 )

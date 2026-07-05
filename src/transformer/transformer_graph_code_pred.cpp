@@ -6,7 +6,7 @@
 
 namespace qwen3_tts {
 
-struct ggml_cgraph * transformer_internal::ops::build_code_pred_graph(TTSTransformer & self, int32_t n_prev_codes) {
+struct ggml_cgraph * transformer_internal::ops::build_code_pred_graph(TTSTransformer & self, TTSTransformerSession & session, int32_t n_prev_codes) {
     auto & impl = self.impl_;
     const auto & cfg = impl->model.config;
     const int n_head = cfg.code_pred_n_attention_heads;
@@ -19,8 +19,8 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_graph(TTSTransfo
     const int n_codebooks = cfg.n_codebooks;
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ impl->state.compute_meta.size(),
-        /*.mem_buffer =*/ impl->state.compute_meta.data(),
+        /*.mem_size   =*/ session.state_.code_pred_compute_meta[0].size(),
+        /*.mem_buffer =*/ session.state_.code_pred_compute_meta[0].data(),
         /*.no_alloc   =*/ true,
     };
 
@@ -130,7 +130,7 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_graph(TTSTransfo
     return gf;
 }
 
-struct ggml_cgraph * transformer_internal::ops::build_code_pred_prefill_graph(TTSTransformer & self) {
+struct ggml_cgraph * transformer_internal::ops::build_code_pred_prefill_graph(TTSTransformer & self, TTSTransformerSession & session) {
     auto & impl = self.impl_;
     const auto & cfg = impl->model.config;
     const int n_head = cfg.code_pred_n_attention_heads;
@@ -145,8 +145,8 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_prefill_graph(TT
     const bool use_code_pred_mrope = false;
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ impl->state.code_pred_compute_meta[0].size(),
-        /*.mem_buffer =*/ impl->state.code_pred_compute_meta[0].data(),
+        /*.mem_size   =*/ session.state_.code_pred_compute_meta[0].size(),
+        /*.mem_buffer =*/ session.state_.code_pred_compute_meta[0].data(),
         /*.no_alloc   =*/ true,
     };
 
@@ -235,8 +235,8 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_prefill_graph(TT
                                  rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         }
 
-        struct ggml_tensor * k_cache = impl->state.code_pred_cache.k_cache[il];
-        struct ggml_tensor * v_cache = impl->state.code_pred_cache.v_cache[il];
+        struct ggml_tensor * k_cache = session.state_.code_pred_cache.k_cache[il];
+        struct ggml_tensor * v_cache = session.state_.code_pred_cache.v_cache[il];
 
         struct ggml_tensor * Kcache = ggml_cont(ctx0, ggml_permute(ctx0, Kcur, 0, 2, 1, 3));
         struct ggml_tensor * Vcache = ggml_cont(ctx0, ggml_permute(ctx0, Vcur, 0, 2, 1, 3));
@@ -299,7 +299,7 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_prefill_graph(TT
     return gf;
 }
 
-struct ggml_cgraph * transformer_internal::ops::build_code_pred_step_graph(TTSTransformer & self, int32_t n_past, int32_t generation_step) {
+struct ggml_cgraph * transformer_internal::ops::build_code_pred_step_graph(TTSTransformer & self, TTSTransformerSession & session, int32_t n_past, int32_t generation_step) {
     auto & impl = self.impl_;
     const auto & cfg = impl->model.config;
     const int n_head = cfg.code_pred_n_attention_heads;
@@ -314,8 +314,8 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_step_graph(TTSTr
     const bool use_code_pred_mrope = false;
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ impl->state.code_pred_compute_meta[generation_step].size(),
-        /*.mem_buffer =*/ impl->state.code_pred_compute_meta[generation_step].data(),
+        /*.mem_size   =*/ session.state_.code_pred_compute_meta[generation_step].size(),
+        /*.mem_buffer =*/ session.state_.code_pred_compute_meta[generation_step].data(),
         /*.no_alloc   =*/ true,
     };
 
@@ -408,8 +408,8 @@ struct ggml_cgraph * transformer_internal::ops::build_code_pred_step_graph(TTSTr
                                  rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         }
 
-        struct ggml_tensor * k_cache = impl->state.code_pred_cache.k_cache[il];
-        struct ggml_tensor * v_cache = impl->state.code_pred_cache.v_cache[il];
+        struct ggml_tensor * k_cache = session.state_.code_pred_cache.k_cache[il];
+        struct ggml_tensor * v_cache = session.state_.code_pred_cache.v_cache[il];
 
         struct ggml_tensor * Kcache = ggml_cont(ctx0, ggml_permute(ctx0, Kcur, 0, 2, 1, 3));
         struct ggml_tensor * Vcache = ggml_cont(ctx0, ggml_permute(ctx0, Vcur, 0, 2, 1, 3));

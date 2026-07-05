@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <cstdint>
 #include <optional>
 
@@ -156,6 +158,16 @@ public:
 
     // Load only the speaker encoder tensors needed by extract_speaker_embedding().
     bool load_speaker_encoder_only(const std::string & model_dir, const std::string & model_name = "");
+
+    // Opaque per-client inference session. Each session owns its own
+    // scheduler, KV caches, and scratch buffers; the model weights are shared.
+    struct Session {
+        ~Session();
+        std::unique_ptr<TTSTransformerSession> transformer_session;
+    };
+
+    // Create a new session for thread-safe concurrent inference.
+    std::unique_ptr<Session> create_session();
     
     // Generate speech from text
     // text: input text to synthesize
@@ -207,6 +219,46 @@ public:
         const std::vector<float> & speaker_embedding,
         const tts_audio_chunk_callback_t & on_audio_chunk,
         const tts_streaming_params & params = tts_streaming_params());
+
+    // --- Session-aware synthesis (thread-safe, one session per client) ---
+
+    tts_result synthesize_with_voice_streaming(
+        Session & session,
+        const std::string & text,
+        const std::string & reference_audio,
+        const tts_audio_chunk_callback_t & on_audio_chunk,
+        const tts_streaming_params & params = tts_streaming_params());
+
+    tts_result synthesize_with_voice_streaming(
+        Session & session,
+        const std::string & text,
+        const float * ref_samples,
+        int32_t n_ref_samples,
+        const tts_audio_chunk_callback_t & on_audio_chunk,
+        const tts_streaming_params & params = tts_streaming_params());
+
+    tts_result synthesize_with_speaker_embedding_streaming(
+        Session & session,
+        const std::string & text,
+        const std::vector<float> & speaker_embedding,
+        const tts_audio_chunk_callback_t & on_audio_chunk,
+        const tts_streaming_params & params = tts_streaming_params());
+
+    tts_result synthesize_streaming(
+        Session & session,
+        const std::string & text,
+        const tts_audio_chunk_callback_t & on_audio_chunk,
+        const tts_streaming_params & params = tts_streaming_params());
+
+    tts_result synthesize(Session & session,
+                          const std::string & text,
+                          const tts_params & params = tts_params());
+
+    tts_result synthesize_with_voice(Session & session,
+                                      const std::string & text,
+                                      const float * ref_samples,
+                                      int32_t n_ref_samples,
+                                      const tts_params & params = tts_params());
 
     // Extract speaker embedding from reference audio file (WAV)
     bool extract_speaker_embedding(const std::string & reference_audio,
@@ -268,6 +320,7 @@ private:
     AudioTokenizerDecoder audio_decoder_;
     AudioTokenizerDecoder streaming_audio_decoder_;
     voice_prompt_cache_entry voice_prompt_cache_;
+    std::mutex voice_prompt_mutex_;
     
     bool models_loaded_ = false;
     bool encoder_loaded_ = false;
