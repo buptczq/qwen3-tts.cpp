@@ -489,10 +489,20 @@ static inline float run_window(vad & m, vad_graph & g,
 
 // Converts a probability sequence into speech segments [start_ms, end_ms].
 // `probs[i]` corresponds to window i covering samples [i*n_window, (i+1)*n_window).
+//
+// `finalize_open` controls how a speech run that is still in progress at the
+// end of the probability sequence is handled:
+//   - true  (batch mode): finalize it as a segment ending at audio_length_samples.
+//     This matches whisper.cpp, which sees a complete clip.
+//   - false (streaming mode): leave it out of `segs` so the caller can report
+//     it separately as an in-progress (open) segment. Without this, a still-
+//     talking speaker would be reported as a completed segment on every feed,
+//     causing premature cutoff and making min_silence_duration_ms ineffective.
 inline void probs_to_segments(const std::vector<float> & probs,
                               const vad_params & vp,
                               int n_window,
-                              std::vector<std::pair<int,int>> & segs) {
+                              std::vector<std::pair<int,int>> & segs,
+                              bool finalize_open = true) {
     segs.clear();
     const int n_probs = (int)probs.size();
     const int sample_rate = 16000;
@@ -579,7 +589,11 @@ inline void probs_to_segments(const std::vector<float> & probs,
         }
     }
 
-    if (has_curr_speech && (audio_length_samples - curr_speech_start) > min_speech_samples) {
+    // Finalize a still-in-progress speech run at the end of the clip. In batch
+    // mode this is correct (the clip has ended). In streaming mode we skip this
+    // so the run is reported as an open segment instead of a completed one.
+    if (finalize_open && has_curr_speech &&
+        (audio_length_samples - curr_speech_start) > min_speech_samples) {
         speeches.push_back({ curr_speech_start, audio_length_samples });
     }
 
@@ -818,8 +832,12 @@ inline int vad_inc_feed(vad_inc_state * s, vad & m,
 
     // Re-run the segment state machine over the full accumulated probability
     // vector so the merge/padding post-processing stays globally consistent.
+    // finalize_open=false: a speech run still in progress at the end must NOT
+    // be reported as a completed segment (that would cut off a still-talking
+    // speaker and make min_silence_duration_ms ineffective). It is reported
+    // separately as the open segment below.
     std::vector<std::pair<int,int>> segs;
-    probs_to_segments(s->probs, s->vp, s->n_window, segs);
+    probs_to_segments(s->probs, s->vp, s->n_window, segs, /*finalize_open=*/false);
     s->completed_segments = segs;
 
     // Derive the (still-open) speech segment by scanning the probability
