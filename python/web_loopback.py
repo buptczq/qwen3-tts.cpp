@@ -332,7 +332,7 @@ class LoopbackPipeline:
                         logger.warning("ref '%s' load failed: %s", ref_name, exc)
 
             tts_params = {k: v for k, v in params_snapshot.items()
-                          if k not in ("ref_name",)}
+                          if k not in ("ref_name", "asr_only", "vad_params")}
             tts_params.setdefault("max_audio_tokens", max(128, len(text) * 3))
 
             t_tts = time.perf_counter()
@@ -843,7 +843,9 @@ function ensureTurn(segId) {
       <div class="asr pending" id="turn-${segId}-asr">listening&hellip;</div>
       <div class="tts-echo" id="turn-${segId}-tts" style="display:none"></div>
       <div class="meta" id="turn-${segId}-meta"></div>`;
-    document.getElementById("transcript").appendChild(turn);
+    // Prepend so the newest segment shows at the top.
+    const transcript = document.getElementById("transcript");
+    transcript.insertBefore(turn, transcript.firstChild);
   }
   return turn;
 }
