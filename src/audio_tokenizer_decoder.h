@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -85,6 +86,7 @@ private:
     bool load_model_impl(const std::string & model_path, bool shared_backend);
 
     std::unique_ptr<audio_decoder_private> impl_;
+    mutable std::mutex decode_mutex_;
 };
 
 } // namespace qwen3_tts

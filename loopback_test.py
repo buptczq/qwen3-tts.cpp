@@ -16,6 +16,7 @@ Usage:
 import argparse
 import time
 import sys
+import threading
 from pathlib import Path
 from typing import List, Tuple
 import numpy as np
@@ -153,6 +154,144 @@ def simple_cer(reference: str, hypothesis: str) -> float:
     matches = sum(1 for r, h in zip(ref, hyp) if r == h)
     max_len = max(len(ref), len(hyp))
     return 1.0 - (matches / max_len) if max_len > 0 else 0.0
+
+
+def run_concurrent_test(tts: Qwen3TTS, n_threads: int, rounds: int):
+    """Run TTS->VAD->ASR pipeline concurrently from multiple threads.
+
+    Each thread gets its own session and processes a subset of sentences.
+    Verifies that concurrent inference does not crash or produce errors.
+    """
+    sessions = [tts.create_session() for _ in range(n_threads)]
+    errors = [None] * n_threads
+    results = [[] for _ in range(n_threads)]
+
+    sentences_per_thread = (len(TEST_SENTENCES) + n_threads - 1) // n_threads
+
+    def worker(thread_id: int):
+        session = sessions[thread_id]
+        start_idx = thread_id * sentences_per_thread
+        end_idx = min(start_idx + sentences_per_thread, len(TEST_SENTENCES))
+        my_sentences = TEST_SENTENCES[start_idx:end_idx]
+
+        for iteration in range(rounds):
+            for sent_idx, text in enumerate(my_sentences):
+                label = f"[T{thread_id}] iter={iteration+1} sent={sent_idx+1}/{len(my_sentences)}"
+                try:
+                    audio, sr, segments, first_chunk_ms, tts_ms, vad_ms = \
+                        measure_tts_vad_streaming_session(tts, session, text)
+                    audio_duration_ms = len(audio) / sr * 1000
+
+                    asr_texts = []
+                    asr_total_ms = 0
+                    for seg in segments:
+                        s = int(seg["start_ms"] * sr / 1000)
+                        e = int(seg["end_ms"] * sr / 1000)
+                        seg_text, asr_ms = measure_asr(tts, audio[s:e], sr)
+                        asr_texts.append(seg_text)
+                        asr_total_ms += asr_ms
+
+                    combined = "".join(asr_texts)
+                    cer = simple_cer(text, combined)
+                    total_ms = tts_ms + vad_ms + asr_total_ms
+                    rtf = compute_rtf(audio_duration_ms, total_ms)
+
+                    print(f"  {label}: \"{text}\" -> \"{combined}\" "
+                          f"(CER={cer:.3f}, RTF={rtf:.3f}, {total_ms:.0f}ms)",
+                          file=sys.stderr)
+                    results[thread_id].append({
+                        "text": text, "output": combined,
+                        "cer": cer, "rtf": rtf, "total_ms": total_ms,
+                    })
+                except Exception as exc:
+                    print(f"  {label}: FAILED — {exc}", file=sys.stderr)
+                    errors[thread_id] = str(exc)
+
+    print(f"\n[Concurrent] {n_threads} threads, {rounds} round(s), "
+          f"{len(TEST_SENTENCES)} sentences", file=sys.stderr)
+    print("-" * 70, file=sys.stderr)
+
+    wall_start = time.perf_counter()
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    wall_ms = (time.perf_counter() - wall_start) * 1000
+
+    for s in sessions:
+        s.close()
+
+    all_results = []
+    for r in results:
+        all_results.extend(r)
+
+    any_error = any(e is not None for e in errors)
+    if any_error:
+        print(f"\n[Concurrent] FAILED — errors: {[e for e in errors if e]}", file=sys.stderr)
+        return 1
+
+    if not all_results:
+        print("\n[Concurrent] FAILED — no results collected", file=sys.stderr)
+        return 1
+
+    avg_cer = sum(r["cer"] for r in all_results) / len(all_results)
+    avg_rtf = sum(r["rtf"] for r in all_results) / len(all_results)
+    total_sentences = len(all_results)
+
+    print(f"\n[Concurrent] {total_sentences} sentences in {wall_ms:.0f}ms wall-clock", file=sys.stderr)
+    print(f"  Avg CER: {avg_cer:.3f}, Avg RTF: {avg_rtf:.3f}", file=sys.stderr)
+    print(f"  Result: {'PASS' if avg_cer < 0.3 else 'FAIL'}", file=sys.stderr)
+    return 0 if avg_cer < 0.3 else 1
+
+
+def measure_tts_vad_streaming_session(tts, session, text, max_seg_ms=30000):
+    """Session-aware variant of measure_tts_vad_streaming."""
+    vad_stream = tts.create_vad_stream(max_seg_ms=max_seg_ms)
+    audio_chunks = []
+    sample_rate = [24000]
+    tts_start = time.perf_counter()
+    first_chunk_time = [None]
+    vad_time = 0.0
+
+    def on_audio_chunk(chunk, sr):
+        nonlocal vad_time
+        sample_rate[0] = sr
+        if first_chunk_time[0] is None:
+            first_chunk_time[0] = (time.perf_counter() - tts_start) * 1000
+        audio_chunks.append(chunk)
+        if sr != 16000:
+            ratio = 16000 / sr
+            new_len = int(len(chunk) * ratio)
+            chunk_16k = np.interp(
+                np.linspace(0, len(chunk) - 1, new_len),
+                np.arange(len(chunk)), chunk
+            ).astype(np.float32)
+        else:
+            chunk_16k = chunk.astype(np.float32)
+        vad_start = time.perf_counter()
+        vad_stream.feed(chunk_16k)
+        vad_time += (time.perf_counter() - vad_start) * 1000
+        return True
+
+    success, audio, sr, err, t_ms = tts.synthesize_streaming_session(
+        session, text, on_audio_chunk, collect_audio=True
+    )
+    tts_total_ms = (time.perf_counter() - tts_start) * 1000
+
+    if not success:
+        vad_stream.close()
+        raise RuntimeError(f"TTS failed: {err}")
+
+    first_chunk_ms = first_chunk_time[0] if first_chunk_time[0] is not None else tts_total_ms
+    segments = vad_stream.get_segments()
+    open_seg = vad_stream.get_open_segment()
+    if open_seg:
+        segments.append(open_seg)
+    vad_stream.close()
+
+    full_audio = np.concatenate(audio_chunks) if audio_chunks else np.array([], dtype=np.float32)
+    return full_audio, sample_rate[0], segments, first_chunk_ms, tts_total_ms, vad_time
 
 
 def run_loopback_test(args):
@@ -318,15 +457,24 @@ def run_loopback_test(args):
             r = rr["round"]
             print(f"   Round {r}: \"{rr['output_text']}\"  (CER: {rr['cer_from_original']:.3f}, RTF: {rr['rtf']:.3f})")
 
-    # Cleanup
+    final_cer = avg([r["cer_from_original"] for r in flat_results])
+    print(f"\nDone! Final CER: {final_cer:.3f}")
+    seq_ok = final_cer < 0.3
+
+    # Concurrent test
+    concurrent_ok = True
+    if args.concurrent > 1:
+        print("\n" + "=" * 70)
+        print(f"Concurrent Test: {args.concurrent} threads")
+        print("=" * 70)
+        concurrent_ok = run_concurrent_test(tts, args.concurrent, args.rounds) == 0
+
     print("\nCleaning up...")
     tts.free_asr_model()
     tts.free_vad_model()
     tts.close()
 
-    final_cer = avg([r["cer_from_original"] for r in flat_results])
-    print(f"\nDone! Final CER: {final_cer:.3f}")
-    return 0 if final_cer < 0.3 else 1
+    return 0 if (seq_ok and concurrent_ok) else 1
 
 
 def main():
@@ -336,6 +484,8 @@ def main():
     parser.add_argument("--vad-model", required=True, help="Path to VAD model GGUF (FSMN-VAD)")
     parser.add_argument("--iterations", type=int, default=1, help="Number of test iterations")
     parser.add_argument("--rounds", type=int, default=3, help="Number of TTS->VAD->ASR rounds per sentence (default: 3)")
+    parser.add_argument("--concurrent", type=int, default=0, metavar="N",
+                        help="Run concurrent test with N threads after the sequential test (default: 0 = skip)")
     args = parser.parse_args()
 
     # Validate paths

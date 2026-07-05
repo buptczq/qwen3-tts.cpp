@@ -17,6 +17,7 @@ int64_t now_ms() {
 
 bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
                                     std::vector<float> & samples) {
+    std::lock_guard<std::mutex> lock(decode_mutex_);
     auto & model = impl_->model;
     auto & state = impl_->state;
     auto & error_msg = impl_->error_msg;
@@ -109,6 +110,7 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
 }
 
 void AudioTokenizerDecoder::clear_decode_cache() {
+    std::lock_guard<std::mutex> lock(decode_mutex_);
     decoder_internal::ops::release_cached_decode_graph(*this);
 }
 
