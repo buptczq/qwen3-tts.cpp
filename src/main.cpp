@@ -216,7 +216,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  --asr                  Enable ASR mode (transcribe audio)\n");
     fprintf(stderr, "  -a, --audio <file>     Input audio file (WAV, any sample rate)\n");
     fprintf(stderr, "  --asr-model <file>     ASR model GGUF file (SenseVoice or Paraformer)\n");
-    fprintf(stderr, "  --vad-model <file>     FSMN-VAD model GGUF for long audio segmentation\n");
+    fprintf(stderr, "  --vad-model <file>     Silero VAD model (whisper.cpp ggml format) for long audio segmentation\n");
     fprintf(stderr, "  --vad-maxseg <ms>      Max VAD segment duration (default: 30000)\n");
     fprintf(stderr, "  --asr-ids              Output token IDs instead of text\n");
     fprintf(stderr, "  --asr-keep-tags        Keep <|...|> meta tags in SenseVoice output\n");
@@ -229,8 +229,8 @@ void print_usage(const char * program) {
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  TTS:  %s -m ./models -t \"Hello, world!\" -o hello.wav\n", program);
     fprintf(stderr, "  ASR:  %s --asr -a audio.wav --asr-model sensevoice.gguf\n", program);
-    fprintf(stderr, "  ASR+VAD: %s --asr -a audio.wav --asr-model sensevoice.gguf --vad-model fsmn-vad.gguf\n", program);
-    fprintf(stderr, "  VAD:  %s --vad-only -a audio.wav --vad-model fsmn-vad.gguf\n", program);
+    fprintf(stderr, "  ASR+VAD: %s --asr -a audio.wav --asr-model sensevoice.gguf --vad-model silero-vad.gguf\n", program);
+    fprintf(stderr, "  VAD:  %s --vad-only -a audio.wav --vad-model silero-vad.gguf\n", program);
 }
 
 int main(int argc, char ** argv) {

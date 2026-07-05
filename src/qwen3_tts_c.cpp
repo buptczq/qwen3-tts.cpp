@@ -4,7 +4,7 @@
 #include "transformer/transformer_state_internal.h"
 #include "sensevoice_asr.h"
 #include "paraformer_asr.h"
-#include "funasr_vad.h"
+#include "silero_vad.h"
 #include <cstring>
 #include <cstdlib>
 #include <vector>
@@ -31,7 +31,7 @@ struct qwen3_tts_context {
 
     // Cached VAD model
     std::string cached_vad_path;
-    std::unique_ptr<funasr_vad_impl::vad> cached_vad;
+    std::unique_ptr<silero_vad_impl::vad> cached_vad;
 };
 
 struct qwen3_tts_session {
@@ -339,12 +339,38 @@ void qwen3_tts_set_progress_callback(
 
 // ===== ASR / VAD =====
 
+qwen3_vad_params_t qwen3_vad_default_params(void) {
+    qwen3_vad_params_t r;
+    r.threshold = 0.5f;
+    r.min_speech_duration_ms = 250;
+    r.min_silence_duration_ms = 100;
+    r.max_speech_duration_s = 30.0f;  // legacy project default (30s cap)
+    r.speech_pad_ms = 30;
+    return r;
+}
+
 static qwen3_asr_result_t make_asr_error(const char* msg) {
     qwen3_asr_result_t r;
     std::memset(&r, 0, sizeof(r));
     r.success = 0;
     r.error_msg = strdup(msg);
     return r;
+}
+
+// Convert the C API ASR params struct to the internal C++ asr_params.
+static qwen3_tts::asr_params to_asr_params(qwen3_asr_params_t params) {
+    qwen3_tts::asr_params p;
+    if (params.vad_model_path) p.vad_model_path = params.vad_model_path;
+    p.vad_maxseg = params.vad_maxseg > 0 ? params.vad_maxseg : 30000;
+    p.vad_params.threshold = params.vad_params.threshold;
+    p.vad_params.min_speech_duration_ms = params.vad_params.min_speech_duration_ms;
+    p.vad_params.min_silence_duration_ms = params.vad_params.min_silence_duration_ms;
+    p.vad_params.max_speech_duration_s = params.vad_params.max_speech_duration_s;
+    p.vad_params.speech_pad_ms = params.vad_params.speech_pad_ms;
+    p.keep_tags = params.keep_tags != 0;
+    p.output_ids = params.output_ids != 0;
+    p.n_threads = params.n_threads > 0 ? params.n_threads : 8;
+    return p;
 }
 
 static qwen3_asr_result_t convert_asr_result(const qwen3_tts::asr_result& res) {
@@ -394,12 +420,7 @@ qwen3_asr_result_t qwen3_asr_transcribe(
         return make_asr_error("ASR model path is required (or call qwen3_asr_load_model first)");
     }
 
-    qwen3_tts::asr_params p;
-    if (params.vad_model_path) p.vad_model_path = params.vad_model_path;
-    p.vad_maxseg = params.vad_maxseg > 0 ? params.vad_maxseg : 30000;
-    p.keep_tags = params.keep_tags != 0;
-    p.output_ids = params.output_ids != 0;
-    p.n_threads = params.n_threads > 0 ? params.n_threads : 8;
+    qwen3_tts::asr_params p = to_asr_params(params);
 
     // Load audio
     std::vector<float> pcm;
@@ -443,7 +464,11 @@ qwen3_asr_result_t qwen3_asr_transcribe(
         // Re-run with VAD if the cached path doesn't include VAD handling
         // Actually, the _with_model functions don't handle VAD, so we need to do it here
         std::vector<qwen3_tts::vad_segment> segments;
-        if (qwen3_tts::run_vad(p.vad_model_path, pcm_16k, segments, p.vad_maxseg)) {
+        qwen3_tts::vad_params vp = p.vad_params;
+        if (vp.max_speech_duration_s <= 0.0f && p.vad_maxseg > 0) {
+            vp.max_speech_duration_s = p.vad_maxseg / 1000.0f;
+        }
+        if (qwen3_tts::run_vad(p.vad_model_path, pcm_16k, vp, segments)) {
             result.segments = segments;
             // Re-run transcription for each segment
             result.text.clear();
@@ -516,13 +541,33 @@ int32_t qwen3_vad_detect(
     qwen3_vad_segment_t** out_segments,
     int32_t* out_segments_len
 ) {
+    qwen3_vad_params_t vp = qwen3_vad_default_params();
+    if (maxseg_ms > 0) vp.max_speech_duration_s = (float)maxseg_ms / 1000.0f;
+    return qwen3_vad_detect_with_params(ctx, audio_path, vad_gguf, vp, out_segments, out_segments_len);
+}
+
+int32_t qwen3_vad_detect_with_params(
+    qwen3_tts_context_t* ctx,
+    const char* audio_path,
+    const char* vad_gguf,
+    qwen3_vad_params_t params,
+    qwen3_vad_segment_t** out_segments,
+    int32_t* out_segments_len
+) {
     if (!ctx || !audio_path || !vad_gguf || !out_segments || !out_segments_len) return 0;
 
     *out_segments = nullptr;
     *out_segments_len = 0;
 
+    qwen3_tts::vad_params vp;
+    vp.threshold = params.threshold;
+    vp.min_speech_duration_ms = params.min_speech_duration_ms;
+    vp.min_silence_duration_ms = params.min_silence_duration_ms;
+    vp.max_speech_duration_s = params.max_speech_duration_s;
+    vp.speech_pad_ms = params.speech_pad_ms;
+
     std::vector<qwen3_tts::vad_segment> segments;
-    if (!ctx->tts.detect_vad(audio_path, vad_gguf, segments, maxseg_ms > 0 ? maxseg_ms : 30000)) {
+    if (!ctx->tts.detect_vad(audio_path, vad_gguf, vp, segments)) {
         return 0;
     }
 
@@ -607,22 +652,14 @@ int32_t qwen3_vad_load_model(qwen3_tts_context_t* ctx, const char* vad_gguf) {
     if (ctx->cached_vad_path == vad_gguf) return 1;
 
     // Clear previous cache
-    if (ctx->cached_vad && ctx->cached_vad->ctx) {
-        ggml_free(ctx->cached_vad->ctx);
+    if (ctx->cached_vad) {
+        silero_vad_impl::silero_vad_free(*ctx->cached_vad);
     }
     ctx->cached_vad.reset();
     ctx->cached_vad_path.clear();
 
-    auto m = std::make_unique<funasr_vad_impl::vad>();
-    gguf_init_params ip = {false, &m->ctx};
-    gguf_context* gg = gguf_init_from_file(vad_gguf, ip);
-    if (!gg) return 0;
-
-    for (int i = 0; i < gguf_get_n_tensors(gg); i++) {
-        const char* nm = gguf_get_tensor_name(gg, i);
-        m->t[nm] = ggml_get_tensor(m->ctx, nm);
-    }
-    gguf_free(gg);
+    auto m = std::make_unique<silero_vad_impl::vad>();
+    if (!silero_vad_impl::silero_vad_load(*m, vad_gguf)) return 0;
 
     ctx->cached_vad = std::move(m);
     ctx->cached_vad_path = vad_gguf;
@@ -631,8 +668,8 @@ int32_t qwen3_vad_load_model(qwen3_tts_context_t* ctx, const char* vad_gguf) {
 
 void qwen3_vad_free_model(qwen3_tts_context_t* ctx) {
     if (!ctx) return;
-    if (ctx->cached_vad && ctx->cached_vad->ctx) {
-        ggml_free(ctx->cached_vad->ctx);
+    if (ctx->cached_vad) {
+        silero_vad_impl::silero_vad_free(*ctx->cached_vad);
     }
     ctx->cached_vad.reset();
     ctx->cached_vad_path.clear();
@@ -641,17 +678,30 @@ void qwen3_vad_free_model(qwen3_tts_context_t* ctx) {
 // ===== Streaming VAD =====
 
 struct qwen3_vad_stream {
-    funasr_vad_impl::vad* vad_model = nullptr;  // borrowed from context, not owned
-    vad_inc_state inc_state;  // incremental VAD state
+    silero_vad_impl::vad* vad_model = nullptr;  // borrowed from context, not owned
+    silero_vad_impl::vad_inc_state inc_state;  // incremental VAD state
     bool initialized = false;
 };
 
 qwen3_vad_stream_t* qwen3_vad_stream_new(qwen3_tts_context_t* ctx, int32_t max_seg_ms) {
+    qwen3_vad_params_t vp = qwen3_vad_default_params();
+    if (max_seg_ms > 0) vp.max_speech_duration_s = (float)max_seg_ms / 1000.0f;
+    return qwen3_vad_stream_new_with_params(ctx, vp);
+}
+
+qwen3_vad_stream_t* qwen3_vad_stream_new_with_params(qwen3_tts_context_t* ctx, qwen3_vad_params_t params) {
     if (!ctx || !ctx->cached_vad) return nullptr;
+
+    silero_vad_impl::vad_params vp;
+    vp.threshold = params.threshold;
+    vp.min_speech_duration_ms = params.min_speech_duration_ms;
+    vp.min_silence_duration_ms = params.min_silence_duration_ms;
+    vp.max_speech_duration_s = params.max_speech_duration_s;
+    vp.speech_pad_ms = params.speech_pad_ms;
 
     auto stream = new qwen3_vad_stream();
     stream->vad_model = ctx->cached_vad.get();
-    if (!vad_inc_init(&stream->inc_state, *stream->vad_model, max_seg_ms > 0 ? max_seg_ms : 30000)) {
+    if (!silero_vad_impl::vad_inc_init(&stream->inc_state, *stream->vad_model, vp)) {
         delete stream;
         return nullptr;
     }
@@ -661,7 +711,7 @@ qwen3_vad_stream_t* qwen3_vad_stream_new(qwen3_tts_context_t* ctx, int32_t max_s
 
 int32_t qwen3_vad_stream_feed(qwen3_vad_stream_t* stream, const float* pcm, int32_t n_samples) {
     if (!stream || !stream->initialized || !pcm || n_samples <= 0) return 0;
-    int frames = vad_inc_feed(&stream->inc_state, *stream->vad_model, pcm, n_samples);
+    int frames = silero_vad_impl::vad_inc_feed(&stream->inc_state, *stream->vad_model, pcm, n_samples);
     return frames >= 0 ? 1 : 0;
 }
 
@@ -689,7 +739,7 @@ int32_t qwen3_vad_stream_get_open_segment(
 ) {
     if (!stream || !stream->initialized) return 0;
     int start_ms, end_ms;
-    if (!vad_inc_get_open_segment(&stream->inc_state, start_ms, end_ms)) return 0;
+    if (!silero_vad_impl::vad_inc_get_open_segment(&stream->inc_state, start_ms, end_ms)) return 0;
     *out_start_ms = start_ms;
     *out_end_ms = end_ms;
     return 1;
@@ -697,13 +747,13 @@ int32_t qwen3_vad_stream_get_open_segment(
 
 void qwen3_vad_stream_reset(qwen3_vad_stream_t* stream) {
     if (!stream || !stream->initialized) return;
-    vad_inc_reset(&stream->inc_state);
+    silero_vad_impl::vad_inc_reset(&stream->inc_state);
 }
 
 void qwen3_vad_stream_free(qwen3_vad_stream_t* stream) {
     if (!stream) return;
     if (stream->initialized) {
-        vad_inc_free(&stream->inc_state);
+        silero_vad_impl::vad_inc_free(&stream->inc_state);
     }
     delete stream;
 }
@@ -725,12 +775,7 @@ qwen3_asr_result_t qwen3_asr_transcribe_pcm(
         return make_asr_error("ASR model path is required (or call qwen3_asr_load_model first)");
     }
 
-    qwen3_tts::asr_params p;
-    if (params.vad_model_path) p.vad_model_path = params.vad_model_path;
-    p.vad_maxseg = params.vad_maxseg > 0 ? params.vad_maxseg : 30000;
-    p.keep_tags = params.keep_tags != 0;
-    p.output_ids = params.output_ids != 0;
-    p.n_threads = params.n_threads > 0 ? params.n_threads : 8;
+    qwen3_tts::asr_params p = to_asr_params(params);
 
     // Copy PCM to vector
     std::vector<float> pcm_16k(pcm, pcm + n_samples);

@@ -1,8 +1,8 @@
 // asr_pipeline.cpp — Implementation of the unified ASR/VAD API.
-// Delegates to the funasr single-header libraries (funasr_vad.h, sensevoice_asr.h, paraformer_asr.h).
+// Delegates to the single-header libraries (silero_vad.h, sensevoice_asr.h, paraformer_asr.h).
 
 #include "asr_pipeline.h"
-#include "funasr_vad.h"
+#include "silero_vad.h"
 #include "sensevoice_asr.h"
 #include "paraformer_asr.h"
 
@@ -50,10 +50,17 @@ static int64_t now_ms() {
 
 bool run_vad(const std::string& vad_gguf,
              const std::vector<float>& pcm_16k,
-             std::vector<vad_segment>& segments,
-             int maxseg_ms) {
+             const vad_params& vp,
+             std::vector<vad_segment>& segments) {
+    silero_vad_impl::vad_params evp;
+    evp.threshold = vp.threshold;
+    evp.min_speech_duration_ms = vp.min_speech_duration_ms;
+    evp.min_silence_duration_ms = vp.min_silence_duration_ms;
+    evp.max_speech_duration_s = vp.max_speech_duration_s;
+    evp.speech_pad_ms = vp.speech_pad_ms;
+
     std::vector<std::pair<int,int>> raw;
-    if (!funasr_vad_segments(vad_gguf, pcm_16k, maxseg_ms, raw)) {
+    if (!silero_vad_impl::silero_vad_segments(vad_gguf, pcm_16k, evp, raw)) {
         return false;
     }
     segments.clear();
@@ -62,6 +69,15 @@ bool run_vad(const std::string& vad_gguf,
         segments.push_back({p.first, p.second});
     }
     return true;
+}
+
+bool run_vad(const std::string& vad_gguf,
+             const std::vector<float>& pcm_16k,
+             std::vector<vad_segment>& segments,
+             int maxseg_ms) {
+    vad_params vp;
+    if (maxseg_ms > 0) vp.max_speech_duration_s = maxseg_ms / 1000.0f;
+    return run_vad(vad_gguf, pcm_16k, vp, segments);
 }
 
 // ===== SenseVoice =====
@@ -120,7 +136,11 @@ asr_result transcribe_sensevoice(const std::string& model_gguf,
     // Handle VAD segmentation if requested
     if (!params.vad_model_path.empty()) {
         std::vector<vad_segment> segments;
-        if (!run_vad(params.vad_model_path, pcm_16k, segments, params.vad_maxseg)) {
+        vad_params vp = params.vad_params;
+        if (vp.max_speech_duration_s <= 0.0f && params.vad_maxseg > 0) {
+            vp.max_speech_duration_s = params.vad_maxseg / 1000.0f;
+        }
+        if (!run_vad(params.vad_model_path, pcm_16k, vp, segments)) {
             result.error_msg = "VAD failed";
             if (m.ctx_w) ggml_free(m.ctx_w);
             return result;
@@ -208,7 +228,11 @@ asr_result transcribe_paraformer(const std::string& model_gguf,
     // Handle VAD segmentation if requested
     if (!params.vad_model_path.empty()) {
         std::vector<vad_segment> segments;
-        if (!run_vad(params.vad_model_path, pcm_16k, segments, params.vad_maxseg)) {
+        vad_params vp = params.vad_params;
+        if (vp.max_speech_duration_s <= 0.0f && params.vad_maxseg > 0) {
+            vp.max_speech_duration_s = params.vad_maxseg / 1000.0f;
+        }
+        if (!run_vad(params.vad_model_path, pcm_16k, vp, segments)) {
             result.error_msg = "VAD failed";
             if (m.ctx_w) ggml_free(m.ctx_w);
             return result;

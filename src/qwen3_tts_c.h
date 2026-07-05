@@ -209,9 +209,25 @@ typedef struct {
     int32_t end_ms;
 } qwen3_vad_segment_t;
 
+// Silero VAD parameters. Mirrors whisper.cpp's whisper_vad_params (minus the
+// samples_overlap field, which is not used by this project's time-direct
+// segmentation). Values of 0 / <=0 mean "use the default" where noted.
+typedef struct {
+    float    threshold;                 // speech probability threshold (default 0.5)
+    int32_t  min_speech_duration_ms;    // discard shorter segments (default 250)
+    int32_t  min_silence_duration_ms;   // silence to end a segment (default 100)
+    float    max_speech_duration_s;     // 0 = unlimited (default 30.0)
+    int32_t  speech_pad_ms;             // pad each segment (default 30)
+} qwen3_vad_params_t;
+
+// Returns the default VAD parameters (matches whisper.cpp defaults, with
+// max_speech_duration_s = 30.0 to preserve the project's legacy 30s cap).
+QWEN3_TTS_API qwen3_vad_params_t qwen3_vad_default_params(void);
+
 typedef struct {
     const char* vad_model_path;   // NULL = no VAD segmentation
     int32_t vad_maxseg;           // max segment duration in ms (default 30000)
+    qwen3_vad_params_t vad_params; // full VAD params (used when vad_model_path is set)
     int32_t keep_tags;            // keep <|...|> meta tags in SenseVoice output
     int32_t output_ids;           // output token IDs instead of text
     int32_t n_threads;            // CPU threads (default 8)
@@ -238,7 +254,7 @@ QWEN3_TTS_API qwen3_asr_result_t qwen3_asr_transcribe(
     qwen3_asr_params_t params
 );
 
-// Detect speech segments using FSMN-VAD.
+// Detect speech segments using Silero VAD with default parameters.
 // Returns segments via output params. Returns 1 on success, 0 on failure.
 // Caller must free *out_segments with qwen3_vad_free_segments() when done.
 QWEN3_TTS_API int32_t qwen3_vad_detect(
@@ -246,6 +262,16 @@ QWEN3_TTS_API int32_t qwen3_vad_detect(
     const char* audio_path,
     const char* vad_gguf,
     int32_t maxseg_ms,
+    qwen3_vad_segment_t** out_segments,
+    int32_t* out_segments_len
+);
+
+// Like qwen3_vad_detect but with the full set of VAD parameters.
+QWEN3_TTS_API int32_t qwen3_vad_detect_with_params(
+    qwen3_tts_context_t* ctx,
+    const char* audio_path,
+    const char* vad_gguf,
+    qwen3_vad_params_t params,
     qwen3_vad_segment_t** out_segments,
     int32_t* out_segments_len
 );
@@ -274,9 +300,13 @@ QWEN3_TTS_API void qwen3_vad_free_model(qwen3_tts_context_t* ctx);
 // Opaque handle for streaming VAD state
 typedef struct qwen3_vad_stream qwen3_vad_stream_t;
 
-// Create a new streaming VAD context using the cached VAD model.
-// Returns NULL if no VAD model is cached.
+// Create a new streaming VAD context using the cached VAD model and default
+// parameters. Returns NULL if no VAD model is cached.
 QWEN3_TTS_API qwen3_vad_stream_t* qwen3_vad_stream_new(qwen3_tts_context_t* ctx, int32_t max_seg_ms);
+
+// Like qwen3_vad_stream_new but with the full set of VAD parameters.
+QWEN3_TTS_API qwen3_vad_stream_t* qwen3_vad_stream_new_with_params(
+    qwen3_tts_context_t* ctx, qwen3_vad_params_t params);
 
 // Feed PCM samples (f32, 16kHz mono) to the streaming VAD.
 // Returns 1 on success, 0 on failure.

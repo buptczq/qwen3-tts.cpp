@@ -291,13 +291,19 @@ public:
                           const std::string& model_gguf,
                           const asr_params& params);
 
-    // Detect speech segments using FSMN-VAD.
+    // Detect speech segments using Silero VAD with default parameters.
     // audio_path: path to WAV file
-    // vad_gguf: path to the VAD model GGUF file
+    // vad_gguf: path to the VAD model file (whisper.cpp-style ggml format)
     bool detect_vad(const std::string& audio_path,
                     const std::string& vad_gguf,
                     std::vector<vad_segment>& segments,
                     int maxseg_ms = 30000);
+
+    // Detect speech segments using Silero VAD with the full set of parameters.
+    bool detect_vad(const std::string& audio_path,
+                    const std::string& vad_gguf,
+                    const vad_params& vp,
+                    std::vector<vad_segment>& segments);
     
 private:
     friend struct pipeline_internal::ops;

@@ -1,5 +1,5 @@
 // asr_pipeline.h — Unified ASR/VAD API for qwen3-tts.cpp.
-// Wraps FSMN-VAD, SenseVoice, and Paraformer from the funasr ggml runtime.
+// Wraps Silero VAD, SenseVoice, and Paraformer from the ggml runtime.
 #pragma once
 
 #include <cstdint>
@@ -17,6 +17,16 @@ struct vad_segment {
     int end_ms = 0;
 };
 
+// Silero VAD parameters (mirrors whisper.cpp's whisper_vad_params). These are
+// plain data (no ggml types) so this header stays light.
+struct vad_params {
+    float    threshold               = 0.5f;
+    int      min_speech_duration_ms  = 250;
+    int      min_silence_duration_ms = 100;
+    float    max_speech_duration_s   = 30.0f;  // 0 = unlimited
+    int      speech_pad_ms           = 30;
+};
+
 struct asr_result {
     std::string text;
     std::vector<int> token_ids;
@@ -28,7 +38,8 @@ struct asr_result {
 
 struct asr_params {
     std::string vad_model_path;
-    int vad_maxseg = 30000;
+    int vad_maxseg = 30000;          // legacy: max VAD segment in ms (used if vad_params.max_speech_duration_s <= 0)
+    vad_params vad_params;           // full VAD params (takes precedence when set)
     bool keep_tags = false;
     bool output_ids = false;
     int n_threads = 8;
@@ -37,11 +48,17 @@ struct asr_params {
 // Resample audio from source_rate to 16kHz mono (linear interpolation).
 std::vector<float> resample_to_16k(const float* samples, int n_samples, int source_rate);
 
-// VAD-only: detect speech segments in 16kHz mono PCM.
+// VAD-only: detect speech segments in 16kHz mono PCM with default params.
 bool run_vad(const std::string& vad_gguf,
              const std::vector<float>& pcm_16k,
              std::vector<vad_segment>& segments,
              int maxseg_ms = 30000);
+
+// VAD-only: detect speech segments with the full set of VAD parameters.
+bool run_vad(const std::string& vad_gguf,
+             const std::vector<float>& pcm_16k,
+             const vad_params& vp,
+             std::vector<vad_segment>& segments);
 
 // Transcribe with SenseVoice (16kHz mono PCM input).
 asr_result transcribe_sensevoice(const std::string& model_gguf,

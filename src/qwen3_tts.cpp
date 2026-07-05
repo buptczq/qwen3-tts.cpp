@@ -35,6 +35,15 @@ bool Qwen3TTS::detect_vad(const std::string& audio_path,
                            const std::string& vad_gguf,
                            std::vector<vad_segment>& segments,
                            int maxseg_ms) {
+    vad_params vp;
+    if (maxseg_ms > 0) vp.max_speech_duration_s = maxseg_ms / 1000.0f;
+    return detect_vad(audio_path, vad_gguf, vp, segments);
+}
+
+bool Qwen3TTS::detect_vad(const std::string& audio_path,
+                           const std::string& vad_gguf,
+                           const vad_params& vp,
+                           std::vector<vad_segment>& segments) {
     std::vector<float> samples;
     int sample_rate = 0;
     if (!load_audio_file(audio_path, samples, sample_rate)) {
@@ -42,7 +51,7 @@ bool Qwen3TTS::detect_vad(const std::string& audio_path,
     }
 
     auto pcm_16k = resample_to_16k(samples.data(), (int)samples.size(), sample_rate);
-    return run_vad(vad_gguf, pcm_16k, segments, maxseg_ms);
+    return run_vad(vad_gguf, pcm_16k, vp, segments);
 }
 
 } // namespace qwen3_tts

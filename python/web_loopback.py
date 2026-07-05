@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""
-Web Loopback Streaming Test: Microphone -> VAD -> ASR -> TTS -> Playback.
+"""Web Loopback Streaming Test: Microphone -> VAD -> ASR -> (TTS -> Playback).
 
 Captures microphone audio via browser, runs streaming VAD to detect speech
-segments, performs ASR on each segment, and streams TTS synthesis of the
-recognized text back to the browser. Displays real-time metrics for each
-pipeline stage.
+segments, performs ASR on each segment, and (in Loopback mode) streams TTS
+synthesis of the recognized text back to the browser. In ASR-only mode, TTS
+and playback are skipped and only the VAD + ASR results are streamed.
+Displays real-time metrics for each pipeline stage.
 
 Usage:
     uv run python/web_loopback.py \\
         --tts-model-dir /path/to/tts/models \\
         --asr-model /path/to/sensevoice.gguf \\
-        --vad-model /path/to/fsmn-vad.gguf \\
+        --vad-model /path/to/silero-vad.gguf \\
         --port 8766 --refs-dir refs
 """
 
@@ -34,7 +34,7 @@ import numpy as np
 import aiohttp
 from aiohttp import web
 
-from qwen3_tts import Qwen3TTS
+from qwen3_tts import Qwen3TTS, VadParams
 
 logger = logging.getLogger("web_loopback")
 
@@ -76,6 +76,17 @@ _SHUTDOWN_SENTINEL = object()
 _RESET_SENTINEL = object()
 
 
+def _vad_params_from_dict(d: dict) -> VadParams:
+    """Build a VadParams from a dict of {field: value}, skipping None/missing."""
+    return VadParams(
+        threshold=d.get("threshold") if d.get("threshold") is not None else None,
+        min_speech_duration_ms=d.get("min_speech_duration_ms") if d.get("min_speech_duration_ms") is not None else None,
+        min_silence_duration_ms=d.get("min_silence_duration_ms") if d.get("min_silence_duration_ms") is not None else None,
+        max_speech_duration_s=d.get("max_speech_duration_s") if d.get("max_speech_duration_s") is not None else None,
+        speech_pad_ms=d.get("speech_pad_ms") if d.get("speech_pad_ms") is not None else None,
+    )
+
+
 class LoopbackPipeline:
     """Mic audio -> streaming VAD -> ASR -> streaming TTS.
 
@@ -86,13 +97,15 @@ class LoopbackPipeline:
     """
 
     def __init__(self, tts: Qwen3TTS, session, out_queue, refs_dir: Path,
-                 loop: asyncio.AbstractEventLoop):
+                 loop: asyncio.AbstractEventLoop, vad_params=None):
         self._tts = tts
         self._session = session
         self._out = out_queue
         self._refs_dir = refs_dir
         self._loop = loop
-        self._vad = tts.create_vad_stream()
+        self._vad_params = vad_params
+        self._vad = tts.create_vad_stream(vad_params=vad_params)
+        self._asr_only = False
         self._audio_chunks: list[np.ndarray] = []
         self._total_samples = 0
         self._seen_segments = 0
@@ -104,14 +117,33 @@ class LoopbackPipeline:
         self._worker.start()
         self._trimmed_offset = 0
         # Lock protecting _audio_chunks, _total_samples, _trimmed_offset,
-        # _seen_segments, _vad, and _params.
+        # _seen_segments, _vad, _params, and _vad_params.
         self._lock = threading.Lock()
         # When True, feed_audio discards incoming audio (set inside _process).
         self._processing = False
 
     def set_params(self, params: dict) -> None:
         with self._lock:
+            # If VAD params are present, rebuild the stream with the new params.
+            # This resets LSTM state and accumulated segments, matching the
+            # semantics of a live VAD reconfiguration.
+            vp = params.get("vad_params")
+            if vp is not None:
+                if isinstance(vp, dict):
+                    vp = _vad_params_from_dict(vp)
+                self._vad_params = vp
+                old = self._vad
+                self._vad = self._tts.create_vad_stream(vad_params=vp)
+                try:
+                    old.close()
+                except Exception:
+                    pass
+                self._audio_chunks.clear()
+                self._total_samples = 0
+                self._seen_segments = 0
+                self._trimmed_offset = 0
             self._params = dict(params)
+            self._asr_only = bool(params.get("asr_only", False))
 
     def _put_out(self, msg: dict) -> None:
         """Thread-safe push to the asyncio out queue (non-blocking, drop on full)."""
@@ -278,6 +310,11 @@ class LoopbackPipeline:
             if not res["success"] or not text.strip():
                 return
 
+            # ASR-only mode: stop after transcription (no TTS / playback).
+            if self._asr_only:
+                logger.info("[seg#%d] ASR-only mode: skipping TTS", seg_id)
+                return
+
             ref_name = params_snapshot.get("ref_name")
             ref_path: Optional[str] = None
             ref_text: Optional[str] = None
@@ -421,7 +458,8 @@ async def ws_handler(request):
     session = tts.create_session()
     loop = asyncio.get_running_loop()
     out_q: asyncio.Queue = asyncio.Queue(maxsize=256)
-    pipeline = LoopbackPipeline(tts, session, out_q, refs_dir, loop)
+    pipeline = LoopbackPipeline(tts, session, out_q, refs_dir, loop,
+                               vad_params=request.app.get("vad_params"))
 
     async def drain():
         while True:
@@ -563,6 +601,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .turn .meta span.err { background: #fee2e2; color: #991b1b; }
   #params-body { display: none; margin-top: 10px; grid-template-columns: 1fr 1fr; gap: 8px 14px; }
   #params-body.open { display: grid; }
+  #vad-body { display: none; margin-top: 10px; grid-template-columns: 1fr 1fr; gap: 8px 14px; }
+  #vad-body.open { display: grid; }
   .param { display: flex; align-items: center; gap: 6px; font-size: 13px; }
   .param label { color: #4b5563; min-width: 78px; }
   .param input, .param select {
@@ -617,6 +657,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <span id="status-text">click Start, then speak</span>
         <div id="mic-meter"><div class="fill"></div></div>
       </div>
+      <div id="mode-row" style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+        <label style="font-size:13px;color:#4b5563">Mode:</label>
+        <select id="p-mode" style="padding:4px 8px;border-radius:6px;border:1px solid #d1d5db;font-size:13px">
+          <option value="loopback" selected>Loopback (Mic&rarr;VAD&rarr;ASR&rarr;TTS&rarr;Playback)</option>
+          <option value="asr_only">ASR only (Mic&rarr;VAD&rarr;ASR)</option>
+        </select>
+      </div>
     </div>
 
     <div class="card" style="flex:1; display:flex; flex-direction:column; min-height:0;">
@@ -663,6 +710,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <input type="text" id="p-instr" placeholder="e.g. 用平静的语气说"></div>
         <div class="param param-full"><label>Speaker</label>
           <input type="text" id="p-speaker" placeholder="speaker name"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content: space-between; align-items: center;">
+        <h3 style="margin:0">VAD Parameters</h3>
+        <button class="btn btn-secondary" id="btn-toggle-vad" style="padding:4px 10px; font-size:12px">Show</button>
+      </div>
+      <div id="vad-body">
+        <div class="param"><label>Threshold</label>
+          <input type="range" id="p-vthr" min="0.1" max="0.9" step="0.05" value="0.5">
+          <span class="val" id="p-vthr-v">0.50</span></div>
+        <div class="param"><label>Min speech (ms)</label>
+          <input type="number" id="p-vmsp" value="250" min="0" max="2000" step="50"></div>
+        <div class="param"><label>Min silence (ms)</label>
+          <input type="number" id="p-vsil" value="100" min="0" max="2000" step="10"></div>
+        <div class="param"><label>Max speech (s)</label>
+          <input type="number" id="p-vmax" value="30" min="0" max="600" step="1"></div>
+        <div class="param"><label>Speech pad (ms)</label>
+          <input type="number" id="p-vpad" value="30" min="0" max="500" step="5"></div>
+        <div class="param param-full" style="font-size:11px;color:#9ca3af;margin-top:2px">
+          Changes rebuild the streaming VAD (resets LSTM state &amp; segments).</div>
       </div>
     </div>
   </div>
@@ -848,6 +917,10 @@ function handleMsg(m) {
       const meta = turn.querySelector(`#turn-${m.segment_id}-meta`);
       meta.innerHTML += `<span>ASR ${Math.round(m.latency_ms)}ms</span>` +
                         `<span>seg ${Math.round(m.seg_dur_ms)}ms</span>`;
+      // In ASR-only mode there is no TTS to follow; mark the turn done.
+      if (document.getElementById("p-mode").value === "asr_only") {
+        setBadge("badge-idle", "LISTENING");
+      }
       break;
     }
     case "tts_chunk": {
@@ -1029,6 +1102,14 @@ function buildParams() {
     left_context_sec: parseFloat(document.getElementById("p-leftctx").value),
     language_id: parseInt(document.getElementById("p-lang").value),
     n_threads: parseInt(document.getElementById("p-threads").value),
+    asr_only: document.getElementById("p-mode").value === "asr_only",
+    vad_params: {
+      threshold: parseFloat(document.getElementById("p-vthr").value),
+      min_speech_duration_ms: parseInt(document.getElementById("p-vmsp").value),
+      min_silence_duration_ms: parseInt(document.getElementById("p-vsil").value),
+      max_speech_duration_s: parseFloat(document.getElementById("p-vmax").value),
+      speech_pad_ms: parseInt(document.getElementById("p-vpad").value),
+    },
   };
   const instr = document.getElementById("p-instr").value.trim();
   const speaker = document.getElementById("p-speaker").value.trim();
@@ -1096,6 +1177,12 @@ document.getElementById("btn-toggle-params").onclick = () => {
   body.classList.toggle("open");
   btn.textContent = body.classList.contains("open") ? "Hide" : "Show";
 };
+document.getElementById("btn-toggle-vad").onclick = () => {
+  const body = document.getElementById("vad-body");
+  const btn = document.getElementById("btn-toggle-vad");
+  body.classList.toggle("open");
+  btn.textContent = body.classList.contains("open") ? "Hide" : "Show";
+};
 document.getElementById("btn-refresh-refs").onclick = loadRefs;
 
 ["p-temp","p-topp","p-rep"].forEach(id => {
@@ -1105,7 +1192,20 @@ document.getElementById("btn-refresh-refs").onclick = loadRefs;
     sendConfig();
   };
 });
-["p-topk","p-chunk","p-leftctx","p-lang","p-threads","p-instr","p-speaker","p-ref"].forEach(id => {
+["p-topk","p-chunk","p-leftctx","p-lang","p-threads","p-instr","p-speaker","p-ref","p-mode"].forEach(id => {
+  const el = document.getElementById(id);
+  el.onchange = sendConfig;
+  el.oninput = sendConfig;
+});
+// VAD threshold slider shows a live value; VAD param changes rebuild the stream.
+{
+  const el = document.getElementById("p-vthr");
+  el.oninput = () => {
+    document.getElementById("p-vthr-v").textContent = parseFloat(el.value).toFixed(2);
+    sendConfig();
+  };
+}
+["p-vmsp","p-vsil","p-vmax","p-vpad"].forEach(id => {
   const el = document.getElementById(id);
   el.onchange = sendConfig;
   el.oninput = sendConfig;
@@ -1128,7 +1228,17 @@ def main():
     parser.add_argument("--asr-model", required=True,
                         help="Path to ASR GGUF (SenseVoice / Paraformer)")
     parser.add_argument("--vad-model", required=True,
-                        help="Path to VAD GGUF (FSMN-VAD)")
+                        help="Path to VAD model (whisper.cpp ggml format, Silero VAD)")
+    parser.add_argument("--vad-threshold", type=float, default=None,
+                        help="VAD speech probability threshold (default 0.5)")
+    parser.add_argument("--vad-min-speech-duration-ms", type=int, default=None,
+                        help="Min speech duration in ms; shorter segments are discarded (default 250)")
+    parser.add_argument("--vad-min-silence-duration-ms", type=int, default=None,
+                        help="Min silence in ms to end a segment (default 100)")
+    parser.add_argument("--vad-max-speech-duration-s", type=float, default=None,
+                        help="Max speech duration in seconds before auto-split (default 30.0)")
+    parser.add_argument("--vad-speech-pad-ms", type=int, default=None,
+                        help="Padding in ms applied to each speech segment (default 30)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--refs-dir", default="refs",
@@ -1158,6 +1268,15 @@ def main():
         logger.error("Failed to load VAD model: %s", args.vad_model)
         sys.exit(1)
 
+    # Build initial VAD params from CLI args (None fields -> C defaults).
+    vad_params = VadParams(
+        threshold=args.vad_threshold,
+        min_speech_duration_ms=args.vad_min_speech_duration_ms,
+        min_silence_duration_ms=args.vad_min_silence_duration_ms,
+        max_speech_duration_s=args.vad_max_speech_duration_s,
+        speech_pad_ms=args.vad_speech_pad_ms,
+    )
+
     logger.info("Warming up ASR Metal backend...")
     t_warmup = time.perf_counter()
     warmup = np.zeros(SAMPLE_RATE_MIC // 2, dtype=np.float32)  # 0.5s silence
@@ -1175,6 +1294,7 @@ def main():
     app = web.Application()
     app["tts"] = tts
     app["refs_dir"] = refs_dir
+    app["vad_params"] = vad_params
 
     async def list_refs(request):
         refs = []

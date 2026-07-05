@@ -6,11 +6,19 @@ Measures performance, real-time factor, latency, and accuracy of the
 speech processing pipeline.
 
 Usage:
-    python loopback_test.py \
-        --tts-model-dir /path/to/tts/models \
-        --asr-model /path/to/sensevoice.gguf \
-        --vad-model /path/to/fsmn-vad.gguf \
-        [--iterations 3]
+    uv run python/loopback_test.py \
+        --tts-model-dir models \
+        --asr-model models/sensevoice-small-q8.gguf \
+        --vad-model models/ggml-silero-v6.2.0.bin \
+        [--iterations 1] [--rounds 1] [--concurrent N]
+
+The script runs a TTS -> VAD -> ASR loopback pipeline over a fixed set of
+Chinese test sentences and reports per-sentence / per-round metrics:
+first-chunk latency, TTS/VAD/ASR time, total time, real-time factor (RTF)
+and character error rate (CER) against the original sentence. With
+`--concurrent N` it additionally stresses multi-threaded inference by
+running N sessions in parallel (each thread owns its own TTS session but
+shares the cached VAD/ASR models).
 """
 
 import argparse
@@ -21,9 +29,10 @@ from pathlib import Path
 from typing import List, Tuple
 import numpy as np
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent / "python"))
-from qwen3_tts import Qwen3TTS
+# Add this script's directory (python/) to path so `qwen3_tts` resolves
+# whether invoked via `uv run python/loopback_test.py` or `python loopback_test.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from qwen3_tts import Qwen3TTS, VadParams
 
 
 # Test sentences (Chinese)
@@ -36,14 +45,15 @@ TEST_SENTENCES = [
 ]
 
 
-def measure_tts_vad_streaming(tts: Qwen3TTS, text: str, max_seg_ms: int = 30000) -> Tuple[np.ndarray, int, List[dict], float, float, float]:
+def measure_tts_vad_streaming(tts: Qwen3TTS, text: str, max_seg_ms: int = 30000,
+                            vad_params=None) -> Tuple[np.ndarray, int, List[dict], float, float, float]:
     """Run streaming TTS -> VAD pipeline.
 
     TTS generates audio chunks which are immediately fed to VAD.
     Returns (full_audio, sample_rate, segments, first_chunk_ms, tts_total_ms, vad_ms).
     """
     # Create VAD stream
-    vad_stream = tts.create_vad_stream(max_seg_ms=max_seg_ms)
+    vad_stream = tts.create_vad_stream(max_seg_ms=max_seg_ms, vad_params=vad_params)
 
     # Collect all audio chunks
     audio_chunks = []
@@ -156,7 +166,7 @@ def simple_cer(reference: str, hypothesis: str) -> float:
     return 1.0 - (matches / max_len) if max_len > 0 else 0.0
 
 
-def run_concurrent_test(tts: Qwen3TTS, n_threads: int, rounds: int):
+def run_concurrent_test(tts: Qwen3TTS, n_threads: int, rounds: int, vad_params=None):
     """Run TTS->VAD->ASR pipeline concurrently from multiple threads.
 
     Each thread gets its own session and processes a subset of sentences.
@@ -179,7 +189,7 @@ def run_concurrent_test(tts: Qwen3TTS, n_threads: int, rounds: int):
                 label = f"[T{thread_id}] iter={iteration+1} sent={sent_idx+1}/{len(my_sentences)}"
                 try:
                     audio, sr, segments, first_chunk_ms, tts_ms, vad_ms = \
-                        measure_tts_vad_streaming_session(tts, session, text)
+                        measure_tts_vad_streaming_session(tts, session, text, vad_params=vad_params)
                     audio_duration_ms = len(audio) / sr * 1000
 
                     asr_texts = []
@@ -245,9 +255,9 @@ def run_concurrent_test(tts: Qwen3TTS, n_threads: int, rounds: int):
     return 0 if avg_cer < 0.3 else 1
 
 
-def measure_tts_vad_streaming_session(tts, session, text, max_seg_ms=30000):
+def measure_tts_vad_streaming_session(tts, session, text, max_seg_ms=30000, vad_params=None):
     """Session-aware variant of measure_tts_vad_streaming."""
-    vad_stream = tts.create_vad_stream(max_seg_ms=max_seg_ms)
+    vad_stream = tts.create_vad_stream(max_seg_ms=max_seg_ms, vad_params=vad_params)
     audio_chunks = []
     sample_rate = [24000]
     tts_start = time.perf_counter()
@@ -294,7 +304,7 @@ def measure_tts_vad_streaming_session(tts, session, text, max_seg_ms=30000):
     return full_audio, sample_rate[0], segments, first_chunk_ms, tts_total_ms, vad_time
 
 
-def run_loopback_test(args):
+def run_loopback_test(args, vad_params=None):
     """Run the full loopback test with multiple rounds."""
     print("=" * 70)
     print("Loopback Test: TTS -> VAD -> ASR -> TTS -> VAD -> ASR ...")
@@ -342,7 +352,7 @@ def run_loopback_test(args):
                 print(f"\n    Round {round_num + 1}/{args.rounds}: \"{current_text}\"")
 
                 # Step 1+2: Streaming TTS -> VAD (overlapped)
-                audio, sr, segments, first_chunk_ms, tts_total_ms, vad_ms = measure_tts_vad_streaming(tts, current_text)
+                audio, sr, segments, first_chunk_ms, tts_total_ms, vad_ms = measure_tts_vad_streaming(tts, current_text, vad_params=vad_params)
                 audio_duration_ms = len(audio) / sr * 1000
                 print(f"      TTS: first_chunk={first_chunk_ms:.1f}ms, total={tts_total_ms:.1f}ms (audio: {audio_duration_ms:.0f}ms, RTF: {compute_rtf(audio_duration_ms, tts_total_ms):.3f})")
                 print(f"      VAD: {vad_ms:.1f}ms, {len(segments)} segments")
@@ -467,7 +477,7 @@ def run_loopback_test(args):
         print("\n" + "=" * 70)
         print(f"Concurrent Test: {args.concurrent} threads")
         print("=" * 70)
-        concurrent_ok = run_concurrent_test(tts, args.concurrent, args.rounds) == 0
+        concurrent_ok = run_concurrent_test(tts, args.concurrent, args.rounds, vad_params=vad_params) == 0
 
     print("\nCleaning up...")
     tts.free_asr_model()
@@ -481,7 +491,17 @@ def main():
     parser = argparse.ArgumentParser(description="Loopback test for TTS -> VAD -> ASR pipeline")
     parser.add_argument("--tts-model-dir", required=True, help="Path to TTS model directory")
     parser.add_argument("--asr-model", required=True, help="Path to ASR model GGUF (SenseVoice or Paraformer)")
-    parser.add_argument("--vad-model", required=True, help="Path to VAD model GGUF (FSMN-VAD)")
+    parser.add_argument("--vad-model", required=True, help="Path to VAD model (whisper.cpp ggml format, Silero VAD)")
+    parser.add_argument("--vad-threshold", type=float, default=None,
+                        help="VAD speech probability threshold (default 0.5)")
+    parser.add_argument("--vad-min-speech-duration-ms", type=int, default=None,
+                        help="Min speech duration in ms; shorter segments are discarded (default 250)")
+    parser.add_argument("--vad-min-silence-duration-ms", type=int, default=None,
+                        help="Min silence in ms to end a segment (default 100)")
+    parser.add_argument("--vad-max-speech-duration-s", type=float, default=None,
+                        help="Max speech duration in seconds before auto-split (default 30.0)")
+    parser.add_argument("--vad-speech-pad-ms", type=int, default=None,
+                        help="Padding in ms applied to each speech segment (default 30)")
     parser.add_argument("--iterations", type=int, default=1, help="Number of test iterations")
     parser.add_argument("--rounds", type=int, default=3, help="Number of TTS->VAD->ASR rounds per sentence (default: 3)")
     parser.add_argument("--concurrent", type=int, default=0, metavar="N",
@@ -499,7 +519,16 @@ def main():
         print(f"Error: VAD model not found: {args.vad_model}")
         return 1
 
-    return run_loopback_test(args)
+    # Build optional VadParams from CLI args (None = use C defaults).
+    vad_params = VadParams(
+        threshold=args.vad_threshold,
+        min_speech_duration_ms=args.vad_min_speech_duration_ms,
+        min_silence_duration_ms=args.vad_min_silence_duration_ms,
+        max_speech_duration_s=args.vad_max_speech_duration_s,
+        speech_pad_ms=args.vad_speech_pad_ms,
+    )
+
+    return run_loopback_test(args, vad_params)
 
 
 if __name__ == "__main__":

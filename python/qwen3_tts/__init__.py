@@ -72,10 +72,52 @@ class _VadSegment(ctypes.Structure):
     ]
 
 
+class _VadParams(ctypes.Structure):
+    """Silero VAD parameters (mirrors qwen3_vad_params_t in the C API)."""
+    _fields_ = [
+        ("threshold",               _float),
+        ("min_speech_duration_ms",  _int32),
+        ("min_silence_duration_ms", _int32),
+        ("max_speech_duration_s",   _float),
+        ("speech_pad_ms",           _int32),
+    ]
+
+
+class VadParams:
+    """User-facing VAD parameters.
+
+    All parameters are optional; passing ``None`` (the default) for a field
+    means "use the C default" via :meth:`Qwen3TTS.default_vad_params`.
+    """
+    __slots__ = ("threshold", "min_speech_duration_ms", "min_silence_duration_ms",
+                 "max_speech_duration_s", "speech_pad_ms")
+
+    def __init__(self, *, threshold=None, min_speech_duration_ms=None,
+                 min_silence_duration_ms=None, max_speech_duration_s=None,
+                 speech_pad_ms=None):
+        self.threshold = threshold
+        self.min_speech_duration_ms = min_speech_duration_ms
+        self.min_silence_duration_ms = min_silence_duration_ms
+        self.max_speech_duration_s = max_speech_duration_s
+        self.speech_pad_ms = speech_pad_ms
+
+    def merge_into(self, base: "_VadParams") -> "_VadParams":
+        """Return a ctypes _VadParams seeded from `base` and overridden by set fields."""
+        out = _VadParams()
+        ctypes.memmove(ctypes.byref(out), ctypes.byref(base), ctypes.sizeof(base))
+        if self.threshold is not None:               out.threshold = _float(self.threshold).value
+        if self.min_speech_duration_ms is not None:  out.min_speech_duration_ms = int(self.min_speech_duration_ms)
+        if self.min_silence_duration_ms is not None: out.min_silence_duration_ms = int(self.min_silence_duration_ms)
+        if self.max_speech_duration_s is not None:   out.max_speech_duration_s = _float(self.max_speech_duration_s).value
+        if self.speech_pad_ms is not None:           out.speech_pad_ms = int(self.speech_pad_ms)
+        return out
+
+
 class _AsrParams(ctypes.Structure):
     _fields_ = [
         ("vad_model_path", _char_ptr),
         ("vad_maxseg",     _int32),
+        ("vad_params",     _VadParams),
         ("keep_tags",      _int32),
         ("output_ids",     _int32),
         ("n_threads",      _int32),
@@ -224,12 +266,22 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
     lib.qwen3_tts_set_progress_callback.argtypes = [_void_ptr, _ProgressCallback, _void_ptr]
 
     # ASR / VAD
+    lib.qwen3_vad_default_params.restype = _VadParams
+    lib.qwen3_vad_default_params.argtypes = []
+
     lib.qwen3_asr_transcribe.restype = _AsrResult
     lib.qwen3_asr_transcribe.argtypes = [_void_ptr, _char_ptr, _char_ptr, _AsrParams]
 
     lib.qwen3_vad_detect.restype = _int32
     lib.qwen3_vad_detect.argtypes = [
         _void_ptr, _char_ptr, _char_ptr, _int32,
+        ctypes.POINTER(ctypes.POINTER(_VadSegment)),
+        ctypes.POINTER(_int32),
+    ]
+
+    lib.qwen3_vad_detect_with_params.restype = _int32
+    lib.qwen3_vad_detect_with_params.argtypes = [
+        _void_ptr, _char_ptr, _char_ptr, _VadParams,
         ctypes.POINTER(ctypes.POINTER(_VadSegment)),
         ctypes.POINTER(_int32),
     ]
@@ -255,6 +307,9 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
     # Streaming VAD
     lib.qwen3_vad_stream_new.restype = _void_ptr
     lib.qwen3_vad_stream_new.argtypes = [_void_ptr, _int32]
+
+    lib.qwen3_vad_stream_new_with_params.restype = _void_ptr
+    lib.qwen3_vad_stream_new_with_params.argtypes = [_void_ptr, _VadParams]
 
     lib.qwen3_vad_stream_feed.restype = _int32
     lib.qwen3_vad_stream_feed.argtypes = [_void_ptr, ctypes.POINTER(_float), _int32]
@@ -765,12 +820,17 @@ class Qwen3TTS:
         """Free the cached ASR model."""
         self._lib.qwen3_asr_free_model(self._ctx)
 
+    def default_vad_params(self) -> _VadParams:
+        """Return the C library's default VAD parameters as a ctypes struct."""
+        return self._lib.qwen3_vad_default_params()
+
     def transcribe(
         self,
         audio_path: Union[str, Path],
         model_gguf: Optional[Union[str, Path]] = None,
         vad_model: Optional[Union[str, Path]] = None,
         vad_maxseg: int = 30000,
+        vad_params: Optional[VadParams] = None,
         keep_tags: bool = False,
         output_ids: bool = False,
         n_threads: int = 8,
@@ -782,8 +842,12 @@ class Qwen3TTS:
         audio_path : path to WAV file (any sample rate)
         model_gguf : path to ASR model GGUF, or None to use cached model
                      (must call load_asr_model() first if None)
-        vad_model  : optional path to FSMN-VAD GGUF for long audio segmentation
-        vad_maxseg : max VAD segment duration in ms
+        vad_model  : optional path to Silero VAD model (whisper.cpp ggml format)
+                     for long audio segmentation
+        vad_maxseg : max VAD segment duration in ms (used when vad_params is None)
+        vad_params : full Silero VAD parameters (threshold, min speech/silence
+                     durations, max speech duration, speech pad). Overrides
+                     vad_maxseg when provided. Pass None to use defaults.
         keep_tags  : keep <|...|> meta tags (SenseVoice only)
         output_ids : return token IDs instead of text
         n_threads  : CPU threads
@@ -798,6 +862,8 @@ class Qwen3TTS:
         p = _AsrParams()
         p.vad_model_path = str(vad_model).encode("utf-8") if vad_model else None
         p.vad_maxseg = vad_maxseg
+        base = self._lib.qwen3_vad_default_params()
+        p.vad_params = vad_params.merge_into(base) if vad_params else base
         p.keep_tags = int(keep_tags)
         p.output_ids = int(output_ids)
         p.n_threads = n_threads
@@ -840,8 +906,14 @@ class Qwen3TTS:
         audio_path: Union[str, Path],
         vad_gguf: Union[str, Path],
         maxseg_ms: int = 30000,
+        vad_params: Optional[VadParams] = None,
     ) -> list[dict]:
-        """Detect speech segments using FSMN-VAD.
+        """Detect speech segments using Silero VAD.
+
+        Parameters
+        ----------
+        vad_params : full Silero VAD parameters. When provided, overrides
+                     maxseg_ms. Pass None to use defaults with maxseg_ms.
 
         Returns
         -------
@@ -850,14 +922,26 @@ class Qwen3TTS:
         segs_ptr = ctypes.POINTER(_VadSegment)()
         segs_len = _int32()
 
-        ok = self._lib.qwen3_vad_detect(
-            self._ctx,
-            str(audio_path).encode("utf-8"),
-            str(vad_gguf).encode("utf-8"),
-            maxseg_ms,
-            ctypes.byref(segs_ptr),
-            ctypes.byref(segs_len),
-        )
+        if vad_params is not None:
+            base = self._lib.qwen3_vad_default_params()
+            vp = vad_params.merge_into(base)
+            ok = self._lib.qwen3_vad_detect_with_params(
+                self._ctx,
+                str(audio_path).encode("utf-8"),
+                str(vad_gguf).encode("utf-8"),
+                vp,
+                ctypes.byref(segs_ptr),
+                ctypes.byref(segs_len),
+            )
+        else:
+            ok = self._lib.qwen3_vad_detect(
+                self._ctx,
+                str(audio_path).encode("utf-8"),
+                str(vad_gguf).encode("utf-8"),
+                maxseg_ms,
+                ctypes.byref(segs_ptr),
+                ctypes.byref(segs_len),
+            )
 
         segments = []
         if ok and segs_len.value > 0 and segs_ptr:
@@ -879,9 +963,17 @@ class Qwen3TTS:
         """Free the cached VAD model."""
         self._lib.qwen3_vad_free_model(self._ctx)
 
-    def create_vad_stream(self, max_seg_ms: int = 30000) -> 'VadStream':
-        """Create a streaming VAD context. Requires a cached VAD model."""
-        return VadStream(self._lib, self._ctx, max_seg_ms)
+    def create_vad_stream(self, max_seg_ms: int = 30000,
+                          vad_params: Optional[VadParams] = None) -> 'VadStream':
+        """Create a streaming VAD context. Requires a cached VAD model.
+
+        Parameters
+        ----------
+        max_seg_ms : max speech segment duration in ms (used when vad_params is None)
+        vad_params : full Silero VAD parameters. When provided, overrides
+                     max_seg_ms. Pass None to use defaults.
+        """
+        return VadStream(self._lib, self._ctx, max_seg_ms, vad_params)
 
     def transcribe_pcm(
         self,
@@ -909,6 +1001,7 @@ class Qwen3TTS:
         p = _AsrParams()
         p.vad_model_path = None
         p.vad_maxseg = 30000
+        p.vad_params = self._lib.qwen3_vad_default_params()
         p.keep_tags = int(keep_tags)
         p.output_ids = int(output_ids)
         p.n_threads = n_threads
@@ -943,9 +1036,15 @@ class Qwen3TTS:
 class VadStream:
     """Streaming VAD context. Feed PCM chunks and get speech segments incrementally."""
 
-    def __init__(self, lib, ctx, max_seg_ms: int = 30000):
+    def __init__(self, lib, ctx, max_seg_ms: int = 30000,
+                 vad_params: Optional[VadParams] = None):
         self._lib = lib
-        self._stream = lib.qwen3_vad_stream_new(ctx, max_seg_ms)
+        if vad_params is not None:
+            base = lib.qwen3_vad_default_params()
+            vp = vad_params.merge_into(base)
+            self._stream = lib.qwen3_vad_stream_new_with_params(ctx, vp)
+        else:
+            self._stream = lib.qwen3_vad_stream_new(ctx, max_seg_ms)
         if not self._stream:
             raise RuntimeError("Failed to create VAD stream (is VAD model loaded?)")
 

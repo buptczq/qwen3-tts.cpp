@@ -175,16 +175,16 @@ target_include_directories(audio_tokenizer_decoder PUBLIC
 qwen3_link_ggml(audio_tokenizer_decoder)
 target_link_libraries(audio_tokenizer_decoder PUBLIC Threads::Threads)
 
-# FSMN-VAD library (ASR voice activity detection)
-add_library(fsmn_vad STATIC
+# Silero VAD library (voice activity detection)
+add_library(silero_vad STATIC
     src/asr_vad_impl.cpp
 )
-target_include_directories(fsmn_vad PUBLIC
+target_include_directories(silero_vad PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${GGML_DIR}/include
 )
-qwen3_link_ggml(fsmn_vad)
-target_link_libraries(fsmn_vad PUBLIC Threads::Threads)
+qwen3_link_ggml(silero_vad)
+target_link_libraries(silero_vad PUBLIC Threads::Threads)
 
 # SenseVoice ASR library
 add_library(sensevoice_asr STATIC
@@ -229,7 +229,7 @@ target_link_libraries(qwen3_tts PUBLIC
     audio_tokenizer_encoder
     speech_tokenizer_encoder
     audio_tokenizer_decoder
-    fsmn_vad
+    silero_vad
     sensevoice_asr
     paraformer_asr
     Threads::Threads
@@ -322,7 +322,7 @@ target_link_libraries(test_decoder PRIVATE
 )
 
 # Install targets
-install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder speech_tokenizer_encoder audio_tokenizer_decoder fsmn_vad sensevoice_asr paraformer_asr qwen3_tts qwen3-tts-cli
+install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder speech_tokenizer_encoder audio_tokenizer_decoder silero_vad sensevoice_asr paraformer_asr qwen3_tts qwen3-tts-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
@@ -336,7 +336,7 @@ install(FILES
     src/speech_tokenizer_encoder.h
     src/audio_tokenizer_decoder.h
     src/asr_pipeline.h
-    src/funasr_vad.h
+    src/silero_vad.h
     src/sensevoice_asr.h
     src/paraformer_asr.h
     src/qwen3_tts.h

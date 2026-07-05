@@ -25,9 +25,19 @@ qwen3-tts.cpp/
     test_encoder.cpp
     test_transformer.cpp        # Deterministic reference comparison
     test_decoder.cpp
+  python/                       # Python bindings, servers, and test scripts
+    qwen3_tts/                  # ctypes bindings (libqwen3_tts)
+    web_streaming.py            # WebSocket TTS streaming server
+    web_streaming_client.py     # CLI client for the streaming server
+    web_loopback.py             # Browser live loopback (Mic→VAD→ASR→TTS)
+    loopback_test.py            # Offline TTS→VAD→ASR regression test
+    demo_streaming.py           # Minimal streaming TTS demo
+    test_streaming.py           # Streaming server unit tests
   scripts/                      # Python utilities
     convert_tts_to_gguf.py      # HuggingFace -> GGUF converter (TTS model)
     convert_tokenizer_to_gguf.py # HuggingFace -> GGUF converter (vocoder)
+    convert_silero_vad_to_ggml.py # PyTorch Silero VAD -> ggml converter
+    download-silero-vad-model.sh # Download pre-converted Silero VAD ggml
     generate_deterministic_reference.py  # Generate Python reference data
     compare_e2e.py              # End-to-end Python vs C++ comparison
     run_all_tests.sh            # Test runner
@@ -213,20 +223,123 @@ uv run python/web_streaming_client.py --upload-ref ref.wav --ref-name my_voice -
 uv run python/web_streaming_client.py --host 127.0.0.1 --port 8765 --text "Hi" -o hi.wav
 ```
 
+## Loopback Test (TTS → VAD → ASR)
+
+`python/loopback_test.py` is an offline, end-to-end regression test for the
+full speech pipeline. It synthesizes each of a fixed set of Chinese test
+sentences with Qwen3-TTS, feeds the streamed audio into Silero VAD to get
+speech segments, runs SenseVoice/Paraformer ASR on each segment, and
+optionally feeds the recognized text back into TTS for several rounds
+(`--rounds`). It then reports per-sentence and per-round metrics:
+
+- **First-chunk latency** — time to the first streamed TTS audio chunk.
+- **TTS / VAD / ASR / total time** — per-stage and total wall-clock time.
+- **RTF** — real-time factor = processing time / audio duration.
+- **CER** — character error rate of the round-trip output vs the original
+  sentence. A passing run has `CER < 0.3` (in practice a healthy pipeline
+  scores 0.000 on these sentences).
+
+With `--concurrent N` it additionally runs N TTS sessions in parallel to
+stress-test thread safety: each thread owns its own TTS session but shares
+the cached VAD/ASR models. The concurrent run passes if no thread errors
+out and the average CER stays below 0.3.
+
+This is the recommended smoke test after changes to the VAD, ASR, or TTS
+streaming paths — it exercises the real streaming TTS callback, the
+incremental (stateful) Silero VAD, and PCM-based ASR together.
+
+### Running the loopback test
+
+```bash
+# Prereqs: build the C++ library and have models under models/
+#   - TTS: models/qwen-talker-*.gguf + models/qwen-tokenizer-*.gguf
+#   - ASR: models/sensevoice-small-q8.gguf (or paraformer)
+#   - VAD: models/ggml-silero-v6.2.0.bin (see scripts/download-silero-vad-model.sh)
+
+# Sequential, single round (quickest sanity check)
+uv run python/loopback_test.py \
+    --tts-model-dir models \
+    --asr-model models/sensevoice-small-q8.gguf \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    --iterations 1 --rounds 1
+
+# Multi-round loopback (output of one round becomes TTS input of the next)
+uv run python/loopback_test.py \
+    --tts-model-dir models \
+    --asr-model models/sensevoice-small-q8.gguf \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    --iterations 1 --rounds 3
+
+# Add a multi-threaded stress test after the sequential run
+uv run python/loopback_test.py \
+    --tts-model-dir models \
+    --asr-model models/sensevoice-small-q8.gguf \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    --iterations 1 --rounds 1 --concurrent 4
+
+# Tune Silero VAD parameters (all optional; defaults match whisper.cpp)
+uv run python/loopback_test.py \
+    --tts-model-dir models \
+    --asr-model models/sensevoice-small-q8.gguf \
+    --vad-model models/ggml-silero-v6.2.0.bin \
+    --vad-threshold 0.6 \
+    --vad-min-speech-duration-ms 250 \
+    --vad-min-silence-duration-ms 150 \
+    --vad-max-speech-duration-s 30 \
+    --vad-speech-pad-ms 50
+```
+
+#### VAD parameters
+
+Both `loopback_test.py` and `web_loopback.py` accept the full set of Silero
+VAD tuning flags (mirroring whisper.cpp's `vad-speech-segments` example):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--vad-threshold` | 0.5 | Speech probability threshold; frames above this count as speech |
+| `--vad-min-speech-duration-ms` | 250 | Discard speech segments shorter than this |
+| `--vad-min-silence-duration-ms` | 100 | Silence must last this long to end a segment |
+| `--vad-max-speech-duration-s` | 30.0 | Auto-split segments longer than this at a >98ms silence |
+| `--vad-speech-pad-ms` | 30 | Pad each segment by this much on each side |
+
+Omitting a flag uses the default. `web_loopback.py` additionally accepts a
+live `vad_params` object in the `config` WebSocket message to rebuild the
+streaming VAD with new parameters mid-session.
+
+`--vad-samples-overlap` (whisper.cpp's segment-overlap-when-reassembling) is
+**not** implemented: this project runs ASR on segments directly in the
+original audio timeline rather than reassembling a VAD-trimmed stream, so
+the parameter does not apply.
+
+The script exits `0` on success (final CER < 0.3 and, if run, the
+concurrent test passes) and `1` otherwise. All per-sentence/per-round
+details are printed to stdout; per-thread lines from the concurrent run go
+to stderr.
+
 ## Web Loopback Streaming Test
 
-Browser-based live loopback: **Microphone → VAD → ASR → TTS → Playback**.
-Captures mic audio in the browser, streams it to the server where FSMN-VAD
-detects speech segments, SenseVoice/Paraformer transcribes each segment, and
-Qwen3-TTS streams synthesis of the recognized text back for playback.
+Browser-based live loopback with two modes:
+
+- **Loopback** (default): **Microphone → VAD → ASR → TTS → Playback**.
+  Captures mic audio, Silero VAD detects speech segments, SenseVoice/Paraformer
+  transcribes each segment, and Qwen3-TTS streams synthesis of the recognized
+  text back for playback.
+- **ASR only**: **Microphone → VAD → ASR**. Runs VAD + ASR only (no TTS, no
+  playback) and streams the recognized text to the browser in real time.
+  Useful for inspecting VAD segmentation and ASR accuracy in isolation.
+
 Real-time latency metrics (VAD feed, ASR, TTS first chunk, TTS total, E2E,
-RTF) are displayed alongside a live transcript.
+RTF) are displayed alongside a live transcript. The mode is selectable from
+the browser UI and applied live to subsequent segments.
 
 ```bash
 uv run python/web_loopback.py \
     --tts-model-dir models \
     --asr-model models/sensevoice.gguf \
-    --vad-model models/fsmn-vad.gguf \
+    --vad-model models/silero-vad.gguf \
+    --vad-threshold 0.5 \
+    --vad-min-silence-duration-ms 100 \
+    --vad-speech-pad-ms 30 \
     --port 8766 --refs-dir refs
 ```
 
@@ -234,7 +347,14 @@ Open `http://127.0.0.1:8766` in the browser, click **Start Mic**, and speak.
 TTS parameters (temperature, top-p, top-k, repetition penalty, chunk size,
 left context, language, threads, instruction, speaker, reference audio) are
 configurable from the same panel as `web_streaming.py` and are applied live
-to subsequent segments.
+to subsequent segments. VAD parameters (threshold, min speech/silence
+durations, max speech duration, speech pad) are configurable from a separate
+browser panel — changing them rebuilds the streaming VAD mid-session (resetting
+LSTM state and accumulated segments). VAD parameters also accept the same
+`--vad-*` CLI flags as `loopback_test.py` (see the table above) and may be
+rebuilt live by sending a `config` WebSocket message with a `vad_params`
+object. Switch the **Mode** selector between *Loopback* and *ASR only* at any
+time.
 
 ## Git Conventions
 
