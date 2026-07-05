@@ -17,6 +17,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <chrono>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846   // not guaranteed by <cmath> on MSVC
 #endif
@@ -243,6 +244,8 @@ struct vad_inc_state {
   // Cached backend/allocator
   ggml_backend_t backend = nullptr;
   ggml_gallocr_t gallocr = nullptr;
+  ggml_threadpool_t threadpool = nullptr;  // persistent threadpool
+  int threadpool_nthreads = 0;
   ggml_context* graph_ctx = nullptr;
 
   // PCM tail for fbank overlap (need WINLEN samples for first window)
@@ -314,6 +317,12 @@ inline bool vad_inc_init(vad_inc_state* s, funasr_vad_impl::vad& m, int max_seg_
   using namespace funasr_vad_impl;
   s->backend = ggml_backend_cpu_init();
   s->gallocr = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+  // Create persistent threadpool (1 thread — VAD model is small, and we don't
+  // want to compete with ASR's 8 threads for CPU cores)
+  struct ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
+  s->threadpool = ggml_threadpool_new(&tpp);
+  s->threadpool_nthreads = 1;
+  ggml_backend_cpu_set_threadpool(s->backend, s->threadpool);
   s->max_seg_frames = (max_seg_ms > 0 ? max_seg_ms : 60000) / 10;
   vad_inc_recompute(s);
   s->initialized = true;
@@ -326,6 +335,9 @@ inline int vad_inc_feed(vad_inc_state* s, funasr_vad_impl::vad& m,
                         const float* pcm, int n_samples, int nthreads = 8) {
   using namespace funasr_vad_impl;
   if (!s->initialized || !pcm || n_samples <= 0) return -1;
+
+  auto t_us=[](){auto tp=std::chrono::steady_clock::now();return std::chrono::duration_cast<std::chrono::microseconds>(tp.time_since_epoch()).count();};
+  int64_t v0=t_us();
 
   // Prepend PCM tail from previous call for fbank overlap
   std::vector<float> wav;
@@ -345,11 +357,13 @@ inline int vad_inc_feed(vad_inc_state* s, funasr_vad_impl::vad& m,
   auto feat = fbank80(wav);
   int T_fbank = feat.size();
   if (T_fbank < 1) return 0;
+  int64_t v1=t_us();
 
   // Apply LFR
   int T_lfr = 0;
   auto feats = lfr(feat, s->lm, s->ln, T_lfr);
   if (T_lfr < 1) return 0;
+  int64_t v2=t_us();
 
   // Apply CMVN
   float* shift = (float*)m.g("cmvn.shift")->data;
@@ -357,6 +371,7 @@ inline int vad_inc_feed(vad_inc_state* s, funasr_vad_impl::vad& m,
   for (int t = 0; t < T_lfr; t++)
     for (int d = 0; d < s->idim; d++)
       feats[(size_t)t * s->idim + d] = (feats[(size_t)t * s->idim + d] + shift[d]) * scale[d];
+  int64_t v3=t_us();
 
   // Build and run encoder graph
   ggml_init_params cp = {(size_t)16 * 1024 * 1024, nullptr, true};
@@ -392,11 +407,17 @@ inline int vad_inc_feed(vad_inc_state* s, funasr_vad_impl::vad& m,
   ggml_build_forward_expand(gf, h);
   ggml_gallocr_alloc_graph(s->gallocr, gf);
   ggml_backend_tensor_set(x, feats.data(), 0, ggml_nbytes(x));
-  ggml_backend_cpu_set_n_threads(s->backend, nthreads);
+  // Threadpool is already set on backend during vad_inc_init; no per-call setup needed
+  int64_t v4=t_us();
 
   bool ok = ggml_backend_graph_compute(s->backend, gf) == GGML_STATUS_SUCCESS;
+  int64_t v5=t_us();
   std::vector<float> sc((size_t)s->od * T_lfr);
   if (ok) ggml_backend_tensor_get(h, sc.data(), 0, ggml_nbytes(h));
+  int64_t v6=t_us();
+
+  fprintf(stderr,"vad_feed: n_samples=%d T_fbank=%d T_lfr=%d fbank=%.1fms lfr=%.1fms cmvn=%.1fms graph_build=%.1fms compute=%.1fms get_out=%.1fms total=%.1fms\n",
+    n_samples, T_fbank, T_lfr, (v1-v0)/1000.0, (v2-v1)/1000.0, (v3-v2)/1000.0, (v4-v3)/1000.0, (v5-v4)/1000.0, (v6-v5)/1000.0, (v6-v0)/1000.0);
 
   if (!ok) return -1;
 
@@ -509,9 +530,11 @@ inline void vad_inc_reset(vad_inc_state* s) {
 inline void vad_inc_free(vad_inc_state* s) {
   if (s->gallocr) ggml_gallocr_free(s->gallocr);
   if (s->graph_ctx) ggml_free(s->graph_ctx);
+  if (s->threadpool) ggml_threadpool_free(s->threadpool);
   if (s->backend) ggml_backend_free(s->backend);
   s->gallocr = nullptr;
   s->graph_ctx = nullptr;
+  s->threadpool = nullptr;
   s->backend = nullptr;
   s->initialized = false;
 }

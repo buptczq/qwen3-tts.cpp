@@ -88,10 +88,38 @@ struct model {
   cfg c;
   ggml_context* ctx_w=nullptr;
   std::map<std::string, ggml_tensor*> t;
+  // Cached inference resources. Populated lazily on first paraformer_run_seg call.
+  // Safe to reuse across calls from a single thread at a time.
+  mutable ggml_backend_t be_cache=nullptr;
+  mutable ggml_gallocr_t ga_enc_cache=nullptr;
+  mutable ggml_gallocr_t ga_dec_cache=nullptr;
+  // Persistent encoder graph (rebuilt when T grows).
+  mutable ggml_context* enc_ctx=nullptr;
+  mutable ggml_tensor* enc_x=nullptr;
+  mutable ggml_tensor* enc_h=nullptr;
+  mutable ggml_cgraph* enc_gf=nullptr;
+  mutable int enc_T_alloc=0;
+  // Persistent decoder graph (rebuilt when N or T grows).
+  mutable ggml_context* dec_ctx=nullptr;
+  mutable ggml_tensor* dec_tgt=nullptr;
+  mutable ggml_tensor* dec_mem=nullptr;
+  mutable ggml_tensor* dec_out=nullptr;
+  mutable ggml_cgraph* dec_gf=nullptr;
+  mutable int dec_N_alloc=0;
+  mutable int dec_T_alloc=0;
   ggml_tensor* g(const std::string& n){
     auto it=t.find(n);
     if(it==t.end()){fprintf(stderr,"paraformer: missing %s\n",n.c_str());return nullptr;}
     return it->second;
+  }
+  ~model(){
+    if(enc_gf) enc_gf=nullptr;
+    if(dec_gf) dec_gf=nullptr;
+    if(enc_ctx) ggml_free(enc_ctx);
+    if(dec_ctx) ggml_free(dec_ctx);
+    if(ga_enc_cache) ggml_gallocr_free(ga_enc_cache);
+    if(ga_dec_cache) ggml_gallocr_free(ga_dec_cache);
+    if(be_cache) ggml_backend_free(be_cache);
   }
 };
 
@@ -237,27 +265,37 @@ static inline std::vector<int> paraformer_run_seg(const model& m,
   // Encoder
   std::vector<float> enc;
   {
-    ggml_init_params cp={(size_t)1024*1024*1024,nullptr,true};
-    ggml_context* c=ggml_init(cp);
-    ggml_tensor* x=ggml_new_tensor_2d(c,GGML_TYPE_F32,F,T); ggml_set_input(x);
-    ggml_tensor* h=enc_layer(c,const_cast<model&>(m),"encoder.encoders0.0.",x,T,false);
-    for(int i=0;i<m.c.enc_blocks-1;i++)
-      h=enc_layer(c,const_cast<model&>(m),"encoder.encoders."+std::to_string(i)+".",h,T,true);
-    h=lnorm(c,h,const_cast<model&>(m).g("encoder.after_norm.weight"),
-                const_cast<model&>(m).g("encoder.after_norm.bias"));
-    ggml_set_output(h);
+    ggml_backend_t be=m.be_cache;
+    ggml_gallocr_t ga=m.ga_enc_cache;
+    if(!be){ be=ggml_backend_cpu_init(); m.be_cache=be; }
+    if(!ga){ ga=ggml_gallocr_new(ggml_backend_cpu_buffer_type()); m.ga_enc_cache=ga; }
 
-    ggml_backend_t be=ggml_backend_cpu_init();
-    ggml_cgraph* gf=ggml_new_graph_custom(c,32768,false);
-    ggml_build_forward_expand(gf,h);
-    ggml_gallocr_t ga=ggml_gallocr_new(ggml_backend_cpu_buffer_type());
-    ggml_gallocr_alloc_graph(ga,gf);
-    ggml_backend_tensor_set(x,feats.data(),0,ggml_nbytes(x));
+    if(!m.enc_ctx || T > m.enc_T_alloc){
+      if(m.enc_ctx){
+        fprintf(stderr,"paraformer: rebuilding enc graph T %d -> %d\n", m.enc_T_alloc, T);
+        ggml_free(m.enc_ctx);
+      }
+      ggml_init_params cp={(size_t)1024*1024*1024,nullptr,true};
+      m.enc_ctx=ggml_init(cp);
+      ggml_context* c=m.enc_ctx;
+      ggml_tensor* x=ggml_new_tensor_2d(c,GGML_TYPE_F32,F,T); ggml_set_input(x);
+      ggml_tensor* h=enc_layer(c,const_cast<model&>(m),"encoder.encoders0.0.",x,T,false);
+      for(int i=0;i<m.c.enc_blocks-1;i++)
+        h=enc_layer(c,const_cast<model&>(m),"encoder.encoders."+std::to_string(i)+".",h,T,true);
+      h=lnorm(c,h,const_cast<model&>(m).g("encoder.after_norm.weight"),
+                  const_cast<model&>(m).g("encoder.after_norm.bias"));
+      ggml_set_output(h);
+      m.enc_gf=ggml_new_graph_custom(c,32768,false);
+      ggml_build_forward_expand(m.enc_gf,h);
+      m.enc_x=x; m.enc_h=h; m.enc_T_alloc=T;
+    }
+
+    ggml_gallocr_alloc_graph(ga,m.enc_gf);
+    ggml_backend_tensor_set(m.enc_x,feats.data(),0,ggml_nbytes(m.enc_x));
     ggml_backend_cpu_set_n_threads(be,nthreads);
-    ggml_backend_graph_compute(be,gf);
+    ggml_backend_graph_compute(be,m.enc_gf);
     enc.resize((size_t)T*D);
-    ggml_backend_tensor_get(h,enc.data(),0,ggml_nbytes(h));
-    ggml_gallocr_free(ga); ggml_backend_free(be); ggml_free(c);
+    ggml_backend_tensor_get(m.enc_h,enc.data(),0,ggml_nbytes(m.enc_h));
   }
 
   // CIF predictor (host): conv1d(k=3,pad=1)+residual+relu -> sigmoid -> alpha -> integrate-and-fire
@@ -314,33 +352,45 @@ static inline std::vector<int> paraformer_run_seg(const model& m,
   // Decoder
   std::vector<float> logits;
   {
-    ggml_init_params cp={(size_t)2048*1024*1024,nullptr,true};
-    ggml_context* c=ggml_init(cp);
-    ggml_tensor* tgt=ggml_new_tensor_2d(c,GGML_TYPE_F32,D,N); ggml_set_input(tgt);
-    ggml_tensor* mem=ggml_new_tensor_2d(c,GGML_TYPE_F32,D,T); ggml_set_input(mem);
-    ggml_tensor* x=tgt;
-    for(int i=0;i<m.c.dec_att;i++)
-      x=dec_layer(c,const_cast<model&>(m),"decoder.decoders."+std::to_string(i)+".",x,mem,N,T);
-    for(int i=0;i<m.c.dec3;i++)
-      x=dec3_layer(c,const_cast<model&>(m),"decoder.decoders3."+std::to_string(i)+".",x);
-    x=lnorm(c,x,const_cast<model&>(m).g("decoder.after_norm.weight"),
-                const_cast<model&>(m).g("decoder.after_norm.bias"));
-    x=lin(c,const_cast<model&>(m).g("decoder.output_layer.weight"),
-            const_cast<model&>(m).g("decoder.output_layer.bias"),x);
-    ggml_set_output(x);
+    ggml_backend_t be=m.be_cache;
+    ggml_gallocr_t ga=m.ga_dec_cache;
+    if(!be){ be=ggml_backend_cpu_init(); m.be_cache=be; }
+    if(!ga){ ga=ggml_gallocr_new(ggml_backend_cpu_buffer_type()); m.ga_dec_cache=ga; }
 
-    ggml_backend_t be=ggml_backend_cpu_init();
-    ggml_cgraph* gf=ggml_new_graph_custom(c,32768,false);
-    ggml_build_forward_expand(gf,x);
-    ggml_gallocr_t ga=ggml_gallocr_new(ggml_backend_cpu_buffer_type());
-    ggml_gallocr_alloc_graph(ga,gf);
-    ggml_backend_tensor_set(tgt,acoustic.data(),0,ggml_nbytes(tgt));
-    ggml_backend_tensor_set(mem,enc.data(),0,ggml_nbytes(mem));
+    if(!m.dec_ctx || N > m.dec_N_alloc || T > m.dec_T_alloc){
+      if(m.dec_ctx){
+        fprintf(stderr,"paraformer: rebuilding dec graph (N,T) (%d,%d) -> (%d,%d)\n",
+                m.dec_N_alloc, m.dec_T_alloc, N, T);
+        ggml_free(m.dec_ctx);
+      }
+      ggml_init_params cp={(size_t)2048*1024*1024,nullptr,true};
+      m.dec_ctx=ggml_init(cp);
+      ggml_context* c=m.dec_ctx;
+      ggml_tensor* tgt=ggml_new_tensor_2d(c,GGML_TYPE_F32,D,N); ggml_set_input(tgt);
+      ggml_tensor* mem=ggml_new_tensor_2d(c,GGML_TYPE_F32,D,T); ggml_set_input(mem);
+      ggml_tensor* x=tgt;
+      for(int i=0;i<m.c.dec_att;i++)
+        x=dec_layer(c,const_cast<model&>(m),"decoder.decoders."+std::to_string(i)+".",x,mem,N,T);
+      for(int i=0;i<m.c.dec3;i++)
+        x=dec3_layer(c,const_cast<model&>(m),"decoder.decoders3."+std::to_string(i)+".",x);
+      x=lnorm(c,x,const_cast<model&>(m).g("decoder.after_norm.weight"),
+                  const_cast<model&>(m).g("decoder.after_norm.bias"));
+      x=lin(c,const_cast<model&>(m).g("decoder.output_layer.weight"),
+              const_cast<model&>(m).g("decoder.output_layer.bias"),x);
+      ggml_set_output(x);
+      m.dec_gf=ggml_new_graph_custom(c,32768,false);
+      ggml_build_forward_expand(m.dec_gf,x);
+      m.dec_tgt=tgt; m.dec_mem=mem; m.dec_out=x;
+      m.dec_N_alloc=N; m.dec_T_alloc=T;
+    }
+
+    ggml_gallocr_alloc_graph(ga,m.dec_gf);
+    ggml_backend_tensor_set(m.dec_tgt,acoustic.data(),0,ggml_nbytes(m.dec_tgt));
+    ggml_backend_tensor_set(m.dec_mem,enc.data(),0,ggml_nbytes(m.dec_mem));
     ggml_backend_cpu_set_n_threads(be,nthreads);
-    ggml_backend_graph_compute(be,gf);
+    ggml_backend_graph_compute(be,m.dec_gf);
     logits.resize((size_t)V*N);
-    ggml_backend_tensor_get(x,logits.data(),0,ggml_nbytes(x));
-    ggml_gallocr_free(ga); ggml_backend_free(be); ggml_free(c);
+    ggml_backend_tensor_get(m.dec_out,logits.data(),0,ggml_nbytes(m.dec_out));
   }
 
   // Argmax

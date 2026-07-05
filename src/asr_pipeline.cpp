@@ -13,6 +13,11 @@
 
 namespace qwen3_tts {
 
+static int64_t now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 std::vector<float> resample_to_16k(const float* samples, int n_samples, int source_rate) {
     if (source_rate == 16000) {
         return std::vector<float>(samples, samples + n_samples);
@@ -86,7 +91,11 @@ asr_result transcribe_sensevoice_with_model(const sensevoice::model& m,
     };
 
     int t = 0;
+    int64_t tf0 = now_us();
     auto fb = sensevoice::compute_fbank(pcm_16k, t, &mel_fb);
+    int64_t tf1 = now_us();
+    fprintf(stderr, "asr_pipeline: pcm_samples=%zu fbank_T=%d fbank_time=%.1fms nq=%d\n",
+            pcm_16k.size(), t, (tf1-tf0)/1000.0, nq);
     if (t > 0) run_and_collect(fb, t);
 
     result.t_total_ms = now_ms() - t0;

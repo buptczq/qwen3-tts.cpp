@@ -213,6 +213,29 @@ uv run python/web_streaming_client.py --upload-ref ref.wav --ref-name my_voice -
 uv run python/web_streaming_client.py --host 127.0.0.1 --port 8765 --text "Hi" -o hi.wav
 ```
 
+## Web Loopback Streaming Test
+
+Browser-based live loopback: **Microphone → VAD → ASR → TTS → Playback**.
+Captures mic audio in the browser, streams it to the server where FSMN-VAD
+detects speech segments, SenseVoice/Paraformer transcribes each segment, and
+Qwen3-TTS streams synthesis of the recognized text back for playback.
+Real-time latency metrics (VAD feed, ASR, TTS first chunk, TTS total, E2E,
+RTF) are displayed alongside a live transcript.
+
+```bash
+uv run python/web_loopback.py \
+    --tts-model-dir models \
+    --asr-model models/sensevoice.gguf \
+    --vad-model models/fsmn-vad.gguf \
+    --port 8766 --refs-dir refs
+```
+
+Open `http://127.0.0.1:8766` in the browser, click **Start Mic**, and speak.
+TTS parameters (temperature, top-p, top-k, repetition penalty, chunk size,
+left context, language, threads, instruction, speaker, reference audio) are
+configurable from the same panel as `web_streaming.py` and are applied live
+to subsequent segments.
+
 ## Git Conventions
 
 - Conventional commits: `feat(scope):`, `fix(scope):`, `docs:`

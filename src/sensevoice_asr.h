@@ -8,6 +8,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -16,6 +17,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#ifdef __APPLE__
+#include <sys/resource.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -73,7 +77,31 @@ static inline std::vector<float> compute_fbank(std::vector<float> wav,int&T_out,
 
 struct cfg { int d_model=512,n_head=4,num_blocks=50,tp_blocks=20,kernel=11,vocab=25055,blank=0; };
 struct model { cfg c; ggml_context*ctx_w=nullptr; std::map<std::string,ggml_tensor*> t;
-  ggml_tensor* g(const std::string&n){auto it=t.find(n);if(it==t.end()){fprintf(stderr,"missing %s\n",n.c_str());return nullptr;}return it->second;} };
+  // Cached inference resources. Populated lazily on first run_seg call.
+  // Safe to reuse across calls from a single thread at a time.
+  mutable ggml_backend_t be_cache=nullptr;
+  mutable ggml_gallocr_t ga_cache=nullptr;
+  // Persistent threadpool — avoids creating/destroying 8 threads on every
+  // ggml_backend_graph_compute call, which is extremely expensive on macOS.
+  mutable ggml_threadpool_t threadpool=nullptr;
+  mutable int threadpool_nthreads=0;
+  // Persistent compute graph (built once, reused across calls).
+  // Rebuilt only when the time dimension N grows beyond N_alloc.
+  mutable ggml_context* graph_ctx=nullptr;
+  mutable ggml_tensor* x_p=nullptr;
+  mutable ggml_tensor* logits_p=nullptr;
+  mutable ggml_cgraph* gf_p=nullptr;
+  mutable int N_alloc=0;
+  mutable int run_counter=0;  // incremented on each run_seg call
+  ggml_tensor* g(const std::string&n){auto it=t.find(n);if(it==t.end()){fprintf(stderr,"missing %s\n",n.c_str());return nullptr;}return it->second;}
+  ~model(){
+    if(gf_p) { gf_p=nullptr; }  // owned by graph_ctx
+    if(graph_ctx) ggml_free(graph_ctx);
+    if(threadpool) ggml_threadpool_free(threadpool);
+    if(ga_cache) ggml_gallocr_free(ga_cache);
+    if(be_cache) ggml_backend_free(be_cache);
+  }
+};
 
 static inline ggml_tensor* lin(ggml_context*c,ggml_tensor*w,ggml_tensor*b,ggml_tensor*x){auto y=ggml_mul_mat(c,w,x);return b?ggml_add(c,y,b):y;}
 static inline ggml_tensor* lnorm(ggml_context*c,ggml_tensor*x,ggml_tensor*g,ggml_tensor*b){return ggml_add(c,ggml_mul(c,ggml_norm(c,x,LN_EPS),g),b);}
@@ -131,32 +159,88 @@ static inline std::vector<int> run_seg(const model& m, const int* qtok, int nq,
                                        int nthreads=8){
   const int F=560, D=m.c.d_model, V=m.c.vocab;
   if(T<1) return {};
-  int N=nq+T; std::vector<float> inp((size_t)N*F);
+  int N=nq+T;
+  m.run_counter++;
+  int call_id=m.run_counter;
+
+  // RSS memory (macOS)
+  size_t rss_kb=0;
+#ifdef __APPLE__
+  { struct rusage ru; getrusage(RUSAGE_SELF,&ru); rss_kb=(size_t)ru.ru_maxrss/1024; }
+#endif
+
+  ggml_backend_t be=m.be_cache;
+  ggml_gallocr_t ga=m.ga_cache;
+  if(!be){ be=ggml_backend_cpu_init(); m.be_cache=be; fprintf(stderr,"sensevoice: [call#%d] CPU backend created\n",call_id); }
+  if(!ga){ ga=ggml_gallocr_new(ggml_backend_cpu_buffer_type()); m.ga_cache=ga; }
+  // Create or resize persistent threadpool to avoid per-call thread create/destroy
+  if(!m.threadpool || m.threadpool_nthreads != nthreads){
+    if(m.threadpool) ggml_threadpool_free(m.threadpool);
+    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(nthreads);
+    m.threadpool = ggml_threadpool_new(&tpp);
+    m.threadpool_nthreads = nthreads;
+    ggml_backend_cpu_set_threadpool(be, m.threadpool);
+    fprintf(stderr,"sensevoice: [call#%d] threadpool created nthreads=%d\n",call_id,nthreads);
+  }
+
+  auto t_us=[](){auto tp=std::chrono::steady_clock::now();return std::chrono::duration_cast<std::chrono::microseconds>(tp.time_since_epoch()).count();};
+  int64_t t0=t_us();
+
+  // Build (or rebuild if N grew) the persistent compute graph.
+  bool rebuilt=false;
+  bool is_rebuild = (m.graph_ctx != nullptr);
+  if(!m.graph_ctx || N > m.N_alloc){
+    if(m.graph_ctx){
+      fprintf(stderr,"sensevoice: rebuilding graph ctx N %d -> %d\n", m.N_alloc, N);
+      ggml_free(m.graph_ctx);
+    }
+    ggml_init_params cp={(size_t)1024*1024*1024,nullptr,true};
+    m.graph_ctx=ggml_init(cp);
+    ggml_context*c=m.graph_ctx;
+    ggml_tensor*x=ggml_new_tensor_2d(c,GGML_TYPE_F32,F,N); ggml_set_input(x);
+    ggml_tensor*h=sanm_layer(c,const_cast<model&>(m),"encoder.encoders0.0.",x,N,false);
+    for(int i=0;i<m.c.num_blocks-1;i++) h=sanm_layer(c,const_cast<model&>(m),"encoder.encoders."+std::to_string(i)+".",h,N,true);
+    h=lnorm(c,h,const_cast<model&>(m).g("encoder.after_norm.weight"),const_cast<model&>(m).g("encoder.after_norm.bias"));
+    for(int i=0;i<m.c.tp_blocks;i++) h=sanm_layer(c,const_cast<model&>(m),"encoder.tp_encoders."+std::to_string(i)+".",h,N,true);
+    h=lnorm(c,h,const_cast<model&>(m).g("encoder.tp_norm.weight"),const_cast<model&>(m).g("encoder.tp_norm.bias"));
+    ggml_tensor*logits=lin(c,const_cast<model&>(m).g("ctc.ctc_lo.weight"),const_cast<model&>(m).g("ctc.ctc_lo.bias"),h);
+    ggml_set_output(logits);
+    m.gf_p=ggml_new_graph_custom(c,32768,false); ggml_build_forward_expand(m.gf_p,logits);
+    m.x_p=x; m.logits_p=logits; m.N_alloc=N;
+    // Re-create gallocr for rebuilt graph to avoid stale memory allocation
+    if(is_rebuild && m.ga_cache){ ggml_gallocr_free(m.ga_cache); m.ga_cache=nullptr; }
+    if(!m.ga_cache){ ga=ggml_gallocr_new(ggml_backend_cpu_buffer_type()); m.ga_cache=ga; }
+    rebuilt=true;
+  }
+  int64_t t1=t_us();
+
+  int Na=m.N_alloc; // tensor may be larger than N if graph was reused
+  std::vector<float> inp((size_t)Na*F, 0.0f); // zero-padded to N_alloc
   for(int i=0;i<nq;i++) memcpy(&inp[(size_t)i*F], &emb[qtok[i]*F], F*sizeof(float));
   memcpy(&inp[(size_t)nq*F], fb.data(), (size_t)T*F*sizeof(float));
-  float sc=sqrtf((float)D); for(auto&v:inp)v*=sc; add_posenc(inp,N,F);
-  ggml_backend_t be=ggml_backend_cpu_init();
-  ggml_init_params cp={(size_t)1024*1024*1024,nullptr,true}; ggml_context*c=ggml_init(cp);
-  ggml_tensor*x=ggml_new_tensor_2d(c,GGML_TYPE_F32,F,N); ggml_set_input(x);
-  ggml_tensor*h=sanm_layer(c,const_cast<model&>(m),"encoder.encoders0.0.",x,N,false);
-  for(int i=0;i<m.c.num_blocks-1;i++) h=sanm_layer(c,const_cast<model&>(m),"encoder.encoders."+std::to_string(i)+".",h,N,true);
-  h=lnorm(c,h,const_cast<model&>(m).g("encoder.after_norm.weight"),const_cast<model&>(m).g("encoder.after_norm.bias"));
-  for(int i=0;i<m.c.tp_blocks;i++) h=sanm_layer(c,const_cast<model&>(m),"encoder.tp_encoders."+std::to_string(i)+".",h,N,true);
-  h=lnorm(c,h,const_cast<model&>(m).g("encoder.tp_norm.weight"),const_cast<model&>(m).g("encoder.tp_norm.bias"));
-  ggml_tensor*logits=lin(c,const_cast<model&>(m).g("ctc.ctc_lo.weight"),const_cast<model&>(m).g("ctc.ctc_lo.bias"),h);
-  ggml_set_output(logits);
-  ggml_cgraph*gf=ggml_new_graph_custom(c,32768,false); ggml_build_forward_expand(gf,logits);
-  ggml_gallocr_t ga=ggml_gallocr_new(ggml_backend_cpu_buffer_type()); ggml_gallocr_alloc_graph(ga,gf);
-  ggml_backend_tensor_set(x,inp.data(),0,ggml_nbytes(x)); ggml_backend_cpu_set_n_threads(be,nthreads);
+  float sc=sqrtf((float)D); for(int i=0;i<N*F;i++) inp[i]*=sc;
+  add_posenc(inp,N,F); // posenc only for real N positions
+
+  ggml_gallocr_alloc_graph(ga,m.gf_p);
+  int64_t t2=t_us();
+  ggml_backend_tensor_set(m.x_p,inp.data(),0,ggml_nbytes(m.x_p));
+  ggml_backend_cpu_set_n_threads(be,nthreads);
+  int64_t t3=t_us();
   std::vector<int> seg_ids;
-  if(ggml_backend_graph_compute(be,gf)==GGML_STATUS_SUCCESS){
-    std::vector<float> lg((size_t)V*N); ggml_backend_tensor_get(logits,lg.data(),0,ggml_nbytes(logits));
+  if(ggml_backend_graph_compute(be,m.gf_p)==GGML_STATUS_SUCCESS){
+    int64_t t4=t_us();
+    std::vector<float> lg((size_t)V*Na); ggml_backend_tensor_get(m.logits_p,lg.data(),0,ggml_nbytes(m.logits_p));
     int prev=-1;
     for(int n=0;n<N;n++){ const float*col=&lg[(size_t)n*V]; int am=0; float best=col[0];
       for(int v=1;v<V;v++) if(col[v]>best){best=col[v];am=v;}
       if(am!=prev && am!=m.c.blank) seg_ids.push_back(am); prev=am; }
-  } else { fprintf(stderr,"sensevoice: compute failed\n"); }
-  ggml_gallocr_free(ga); ggml_free(c); ggml_backend_free(be);
+    size_t rss2_kb=0;
+#ifdef __APPLE__
+    { struct rusage ru; getrusage(RUSAGE_SELF,&ru); rss2_kb=(size_t)ru.ru_maxrss/1024; }
+#endif
+    fprintf(stderr,"sensevoice: [call#%d] N=%d Na=%d%s nthreads=%d graph_build=%.1fms alloc=%.1fms set_inp=%.1fms compute=%.1fms get_out=%.1fms total=%.1fms rss_before=%zuMB rss_after=%zuMB\n",
+      call_id, N, Na, rebuilt?" REBUILT":"", nthreads, (t1-t0)/1000.0, (t2-t1)/1000.0, (t3-t2)/1000.0, (t4-t3)/1000.0, (t_us()-t4)/1000.0, (t_us()-t0)/1000.0, rss_kb, rss2_kb);
+  } else { fprintf(stderr,"sensevoice: [call#%d] compute failed\n",call_id); }
   return seg_ids;
 }
 
