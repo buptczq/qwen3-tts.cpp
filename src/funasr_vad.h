@@ -365,10 +365,35 @@ inline int vad_inc_feed(vad_inc_state* s, funasr_vad_impl::vad& m,
   if (T_lfr < 1) return 0;
   int64_t v2=t_us();
 
+  // Prepend lfr_tail from previous call for FSMN encoder context.
+  // The FSMN conv-left kernel (lorder=20) needs lorder-1=19 frames of
+  // left context. Without this, each chunk starts with zero-padded
+  // context, producing inaccurate scores at chunk boundaries.
+  int n_tail = s->lfr_tail_frames;
+  int T_total = n_tail + T_lfr;
+  if (n_tail > 0) {
+    std::vector<float> feats_with_tail((size_t)T_total * s->idim);
+    memcpy(feats_with_tail.data(), s->lfr_tail.data(), (size_t)n_tail * s->idim * sizeof(float));
+    memcpy(feats_with_tail.data() + (size_t)n_tail * s->idim, feats.data(), (size_t)T_lfr * s->idim * sizeof(float));
+    feats = std::move(feats_with_tail);
+  }
+
+  // Save lfr_tail for next call (last lorder-1 frames)
+  int save_frames = s->lorder - 1;
+  if (save_frames > T_lfr) save_frames = T_lfr;
+  if (save_frames > 0) {
+    s->lfr_tail.assign(feats.data() + (size_t)(T_lfr - save_frames) * s->idim,
+                       feats.data() + (size_t)T_lfr * s->idim);
+    s->lfr_tail_frames = save_frames;
+  } else {
+    s->lfr_tail.clear();
+    s->lfr_tail_frames = 0;
+  }
+
   // Apply CMVN
   float* shift = (float*)m.g("cmvn.shift")->data;
   float* scale = (float*)m.g("cmvn.scale")->data;
-  for (int t = 0; t < T_lfr; t++)
+  for (int t = 0; t < T_total; t++)
     for (int d = 0; d < s->idim; d++)
       feats[(size_t)t * s->idim + d] = (feats[(size_t)t * s->idim + d] + shift[d]) * scale[d];
   int64_t v3=t_us();
@@ -378,7 +403,7 @@ inline int vad_inc_feed(vad_inc_state* s, funasr_vad_impl::vad& m,
   if (s->graph_ctx) ggml_free(s->graph_ctx);
   s->graph_ctx = ggml_init(cp);
 
-  ggml_tensor* x = ggml_new_tensor_2d(s->graph_ctx, GGML_TYPE_F32, s->idim, T_lfr);
+  ggml_tensor* x = ggml_new_tensor_2d(s->graph_ctx, GGML_TYPE_F32, s->idim, T_total);
   ggml_set_input(x);
   ggml_tensor* h = lin(s->graph_ctx, m.g("encoder.in_linear1.linear.weight"), m.g("encoder.in_linear1.linear.bias"), x);
   h = lin(s->graph_ctx, m.g("encoder.in_linear2.linear.weight"), m.g("encoder.in_linear2.linear.bias"), h);
@@ -391,7 +416,7 @@ inline int vad_inc_feed(vad_inc_state* s, funasr_vad_impl::vad& m,
     ggml_tensor* zp = ggml_pad_ext(s->graph_ctx, z, 0, 0, s->lorder - 1, 0, 0, 0, 0, 0);
     ggml_tensor* acc = z;
     for (int j = 0; j < s->lorder; j++) {
-      auto sl = ggml_view_2d(s->graph_ctx, zp, s->pd, T_lfr, zp->nb[1], (size_t)j * zp->nb[1]);
+      auto sl = ggml_view_2d(s->graph_ctx, zp, s->pd, T_total, zp->nb[1], (size_t)j * zp->nb[1]);
       auto wj = ggml_view_1d(s->graph_ctx, fk, s->pd, (size_t)j * fk->nb[1]);
       acc = ggml_add(s->graph_ctx, acc, ggml_mul(s->graph_ctx, sl, wj));
     }
@@ -412,12 +437,17 @@ inline int vad_inc_feed(vad_inc_state* s, funasr_vad_impl::vad& m,
 
   bool ok = ggml_backend_graph_compute(s->backend, gf) == GGML_STATUS_SUCCESS;
   int64_t v5=t_us();
+  // Encoder output has T_total rows; skip the first n_tail (context) rows.
   std::vector<float> sc((size_t)s->od * T_lfr);
-  if (ok) ggml_backend_tensor_get(h, sc.data(), 0, ggml_nbytes(h));
+  if (ok && n_tail > 0) {
+    ggml_backend_tensor_get(h, sc.data(), (size_t)n_tail * s->od * sizeof(float), (size_t)T_lfr * s->od * sizeof(float));
+  } else if (ok) {
+    ggml_backend_tensor_get(h, sc.data(), 0, ggml_nbytes(h));
+  }
   int64_t v6=t_us();
 
-  fprintf(stderr,"vad_feed: n_samples=%d T_fbank=%d T_lfr=%d fbank=%.1fms lfr=%.1fms cmvn=%.1fms graph_build=%.1fms compute=%.1fms get_out=%.1fms total=%.1fms\n",
-    n_samples, T_fbank, T_lfr, (v1-v0)/1000.0, (v2-v1)/1000.0, (v3-v2)/1000.0, (v4-v3)/1000.0, (v5-v4)/1000.0, (v6-v5)/1000.0, (v6-v0)/1000.0);
+  fprintf(stderr,"vad_feed: n_samples=%d T_fbank=%d T_lfr=%d T_total=%d n_tail=%d fbank=%.1fms lfr=%.1fms cmvn=%.1fms graph_build=%.1fms compute=%.1fms get_out=%.1fms total=%.1fms\n",
+    n_samples, T_fbank, T_lfr, T_total, n_tail, (v1-v0)/1000.0, (v2-v1)/1000.0, (v3-v2)/1000.0, (v4-v3)/1000.0, (v5-v4)/1000.0, (v6-v5)/1000.0, (v6-v0)/1000.0);
 
   if (!ok) return -1;
 

@@ -70,6 +70,12 @@ def resample(samples: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
 # ── loopback pipeline ───────────────────────────────────────────────────────
 
 
+# Sentinel put on _q to wake the worker for shutdown.
+_SHUTDOWN_SENTINEL = object()
+# Sentinel put on _q to request a pipeline reset from the event loop.
+_RESET_SENTINEL = object()
+
+
 class LoopbackPipeline:
     """Mic audio -> streaming VAD -> ASR -> streaming TTS.
 
@@ -79,11 +85,13 @@ class LoopbackPipeline:
     are posted to out_queue as dicts for the WebSocket handler to forward.
     """
 
-    def __init__(self, tts: Qwen3TTS, session, out_queue: queue.Queue, refs_dir: Path):
+    def __init__(self, tts: Qwen3TTS, session, out_queue, refs_dir: Path,
+                 loop: asyncio.AbstractEventLoop):
         self._tts = tts
         self._session = session
         self._out = out_queue
         self._refs_dir = refs_dir
+        self._loop = loop
         self._vad = tts.create_vad_stream()
         self._audio_chunks: list[np.ndarray] = []
         self._total_samples = 0
@@ -94,70 +102,83 @@ class LoopbackPipeline:
         self._params: dict = {}
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
-        # Offset (in samples) removed from the front of _audio_chunks.
-        # Absolute VAD positions are converted to buffer-relative positions
-        # by subtracting this offset.
         self._trimmed_offset = 0
-        # Flag to discard incoming audio during TTS (prevents queue explosion)
+        # Lock protecting _audio_chunks, _total_samples, _trimmed_offset,
+        # _seen_segments, _vad, and _params.
+        self._lock = threading.Lock()
+        # When True, feed_audio discards incoming audio (set inside _process).
         self._processing = False
 
     def set_params(self, params: dict) -> None:
-        self._params = dict(params)
+        with self._lock:
+            self._params = dict(params)
+
+    def _put_out(self, msg: dict) -> None:
+        """Thread-safe push to the asyncio out queue (non-blocking, drop on full)."""
+        try:
+            self._loop.call_soon_threadsafe(self._out.put_nowait, msg)
+        except (RuntimeError, asyncio.QueueFull):
+            pass
 
     def feed_audio(self, pcm_16k: np.ndarray) -> None:
-        # During TTS, discard incoming audio to prevent queue explosion.
-        if self._processing:
-            return
+        with self._lock:
+            if self._processing:
+                return
 
-        t_feed_start = time.perf_counter()
-        self._audio_chunks.append(pcm_16k)
-        self._total_samples += len(pcm_16k)
+            t_feed_start = time.perf_counter()
+            self._audio_chunks.append(pcm_16k)
+            self._total_samples += len(pcm_16k)
 
-        t_vad_start = time.perf_counter()
-        self._vad.feed(pcm_16k)
-        t_vad_ms = (time.perf_counter() - t_vad_start) * 1000
+            t_vad_start = time.perf_counter()
+            self._vad.feed(pcm_16k)
+            t_vad_ms = (time.perf_counter() - t_vad_start) * 1000
 
-        segments = self._vad.get_segments()
-        if len(segments) > self._seen_segments:
-            for seg in segments[self._seen_segments:]:
-                self._seg_counter += 1
-                seg_id = self._seg_counter
-                self._q.put({
-                    "seg": seg,
-                    "seg_id": seg_id,
-                    "vad_ms": t_vad_ms,
-                    "audio_ready_ms": (time.perf_counter() - t_feed_start) * 1000,
-                })
-                self._out.put({
-                    "type": "vad_segment",
-                    "segment_id": seg_id,
-                    "start_ms": seg["start_ms"],
-                    "end_ms": seg["end_ms"],
-                    "vad_latency_ms": t_vad_ms,
-                })
-                logger.info(
-                    "[seg#%d] VAD detected: start=%dms end=%dms dur=%.2fs "
-                    "queue_depth=%d buf_chunks=%d buf=%.1fs vad_ms=%.1f",
-                    seg_id, seg["start_ms"], seg["end_ms"],
-                    (seg["end_ms"] - seg["start_ms"]) / 1000,
-                    self._q.qsize(), len(self._audio_chunks),
-                    self._total_samples / SAMPLE_RATE_MIC, t_vad_ms,
-                )
-            self._seen_segments = len(segments)
+            segments = self._vad.get_segments()
+            if len(segments) > self._seen_segments:
+                for seg in segments[self._seen_segments:]:
+                    self._seg_counter += 1
+                    seg_id = self._seg_counter
+                    self._q.put({
+                        "seg": seg,
+                        "seg_id": seg_id,
+                        "vad_ms": t_vad_ms,
+                        "audio_ready_ms": (time.perf_counter() - t_feed_start) * 1000,
+                    })
+                    self._put_out({
+                        "type": "vad_segment",
+                        "segment_id": seg_id,
+                        "start_ms": seg["start_ms"],
+                        "end_ms": seg["end_ms"],
+                        "vad_latency_ms": t_vad_ms,
+                    })
+                    logger.info(
+                        "[seg#%d] VAD detected: start=%dms end=%dms dur=%.2fs "
+                        "queue_depth=%d buf_chunks=%d buf=%.1fs vad_ms=%.1f",
+                        seg_id, seg["start_ms"], seg["end_ms"],
+                        (seg["end_ms"] - seg["start_ms"]) / 1000,
+                        self._q.qsize(), len(self._audio_chunks),
+                        self._total_samples / SAMPLE_RATE_MIC, t_vad_ms,
+                    )
+                self._seen_segments = len(segments)
 
-        open_seg = self._vad.get_open_segment()
-        self._out.put({
-            "type": "vad_open",
-            "open": open_seg is not None,
-            "start_ms": open_seg["start_ms"] if open_seg else 0,
-            "total_audio_ms": self._total_samples / SAMPLE_RATE_MIC * 1000,
-        })
+            open_seg = self._vad.get_open_segment()
+            self._put_out({
+                "type": "vad_open",
+                "open": open_seg is not None,
+                "start_ms": open_seg["start_ms"] if open_seg else 0,
+                "total_audio_ms": self._total_samples / SAMPLE_RATE_MIC * 1000,
+            })
 
     def _run(self):
         while not self._stop.is_set():
             try:
                 item = self._q.get(timeout=0.2)
             except queue.Empty:
+                continue
+            if item is _SHUTDOWN_SENTINEL:
+                break
+            if item is _RESET_SENTINEL:
+                self._reset_pipeline()
                 continue
             try:
                 self._process(item)
@@ -190,17 +211,16 @@ class LoopbackPipeline:
         seg_id = item["seg_id"]
         s_abs = int(seg["start_ms"] * SAMPLE_RATE_MIC / 1000)
         e_abs = int(seg["end_ms"] * SAMPLE_RATE_MIC / 1000)
-        logger.info(
-            "[seg#%d] _process start: queue_depth=%d buf_chunks=%d trimmed_offset=%d",
-            seg_id, self._q.qsize(), len(self._audio_chunks), self._trimmed_offset,
-        )
 
-        # Discard incoming audio during the entire process (ASR + TTS) to
-        # prevent buffer/VAD desync. Audio that arrives now will be stale
-        # by the time we finish processing this segment.
-        self._processing = True
-        try:
-            # Convert absolute VAD positions to buffer-relative positions
+        # Snapshot params and extract audio under lock, then release lock for ASR+TTS.
+        with self._lock:
+            params_snapshot = dict(self._params)
+            logger.info(
+                "[seg#%d] _process start: queue_depth=%d buf_chunks=%d trimmed_offset=%d",
+                seg_id, self._q.qsize(), len(self._audio_chunks), self._trimmed_offset,
+            )
+            self._processing = True
+
             s = s_abs - self._trimmed_offset
             e = e_abs - self._trimmed_offset
             buf_samples = sum(len(c) for c in self._audio_chunks)
@@ -211,7 +231,6 @@ class LoopbackPipeline:
                 logger.info("[seg#%d] skip empty slice s_abs=%d e_abs=%d buf=%d rel=[%d..%d]",
                             seg_id, s_abs, e_abs, buf_samples, s, e)
                 return
-            # Log if the slice was truncated by the buffer end
             if e == len(full) and len(full) < (e_abs - self._trimmed_offset):
                 logger.warning(
                     "[seg#%d] BUFFER UNDERRUN: expected %d samples, got %d "
@@ -223,22 +242,19 @@ class LoopbackPipeline:
             seg_dur_ms = len(audio) / SAMPLE_RATE_MIC * 1000
             rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
 
-            # Trim old audio to keep buffer bounded.
-            # Keep a generous 10s margin before the segment start to handle
-            # the case where multiple segments are queued during long ASR processing.
             TRIM_MARGIN = int(10.0 * SAMPLE_RATE_MIC)
             keep_from = max(0, s_abs - TRIM_MARGIN)
             self._trim_front(keep_from)
-            # Recompute buf_samples after trimming for accurate logging
             buf_samples = sum(len(c) for c in self._audio_chunks)
 
-            logger.info(
-                "[seg#%d] ASR slice: s=%d e=%d (%.2fs, %d samples) "
-                "buf=%.1fs rms=%.4f vad_feed=%.2fms",
-                seg_id, s_abs, e_abs, seg_dur_ms / 1000, len(audio),
-                buf_samples / SAMPLE_RATE_MIC, rms, item.get("vad_ms", 0),
-            )
+        logger.info(
+            "[seg#%d] ASR slice: s=%d e=%d (%.2fs, %d samples) "
+            "buf=%.1fs rms=%.4f vad_feed=%.2fms",
+            seg_id, s_abs, e_abs, seg_dur_ms / 1000, len(audio),
+            buf_samples / SAMPLE_RATE_MIC, rms, item.get("vad_ms", 0),
+        )
 
+        try:
             t_asr = time.perf_counter()
             res = self._tts.transcribe_pcm(audio)
             asr_ms = (time.perf_counter() - t_asr) * 1000
@@ -249,7 +265,7 @@ class LoopbackPipeline:
                 seg_id, asr_ms, asr_ms / seg_dur_ms if seg_dur_ms else 0,
                 text, res["success"], res.get("error_msg", ""),
             )
-            self._out.put({
+            self._put_out({
                 "type": "asr_result",
                 "segment_id": seg_id,
                 "text": text,
@@ -262,7 +278,7 @@ class LoopbackPipeline:
             if not res["success"] or not text.strip():
                 return
 
-            ref_name = self._params.get("ref_name")
+            ref_name = params_snapshot.get("ref_name")
             ref_path: Optional[str] = None
             ref_text: Optional[str] = None
             if ref_name and self._refs_dir:
@@ -278,7 +294,7 @@ class LoopbackPipeline:
                     except Exception as exc:
                         logger.warning("ref '%s' load failed: %s", ref_name, exc)
 
-            tts_params = {k: v for k, v in self._params.items()
+            tts_params = {k: v for k, v in params_snapshot.items()
                           if k not in ("ref_name",)}
             tts_params.setdefault("max_audio_tokens", max(128, len(text) * 3))
 
@@ -293,7 +309,7 @@ class LoopbackPipeline:
                 total_samples[0] += len(samples)
                 chunk_count[0] += 1
                 pcm = pcm16_encode(samples)
-                self._out.put({
+                self._put_out({
                     "type": "tts_chunk",
                     "segment_id": seg_id,
                     "data": base64.b64encode(pcm).decode("ascii"),
@@ -321,7 +337,7 @@ class LoopbackPipeline:
                     )
             except Exception as exc:
                 logger.exception("TTS failed for segment %d", seg_id)
-                self._out.put({
+                self._put_out({
                     "type": "error",
                     "segment_id": seg_id,
                     "message": f"TTS failed: {exc}",
@@ -344,7 +360,7 @@ class LoopbackPipeline:
                 chunk_count[0], out_dur_ms / 1000,
                 tts_ms / out_dur_ms if out_dur_ms else 0,
             )
-            self._out.put({
+            self._put_out({
                 "type": "tts_done",
                 "segment_id": seg_id,
                 "latency_ms": tts_ms,
@@ -357,28 +373,39 @@ class LoopbackPipeline:
 
     def _reset_pipeline(self) -> None:
         """Reset pipeline state: clear audio buffer, reset VAD, drain queue.
-        Called from the outer finally block of _process to ensure clean state
-        regardless of whether TTS was executed.
+        Called from the worker thread.
         """
-        self._processing = False
-        self._vad.reset()
-        self._audio_chunks.clear()
-        self._total_samples = 0
-        self._seen_segments = 0
-        self._trimmed_offset = 0
+        with self._lock:
+            self._processing = False
+            if self._vad:
+                self._vad.reset()
+            self._audio_chunks.clear()
+            self._total_samples = 0
+            self._seen_segments = 0
+            self._trimmed_offset = 0
         while not self._q.empty():
             try:
-                self._q.get_nowait()
+                item = self._q.get_nowait()
+                if item is _SHUTDOWN_SENTINEL:
+                    self._q.put(item)
             except queue.Empty:
                 break
 
-    def reset(self) -> None:
-        self._reset_pipeline()
+    def request_reset(self) -> None:
+        """Thread-safe reset request — marshalled to the worker via _q."""
+        self._q.put(_RESET_SENTINEL)
 
     def close(self) -> None:
+        """Shutdown the worker thread. Blocks until the worker has fully exited.
+        After this returns, it is safe to close the TTS session.
+        """
         self._stop.set()
-        self._worker.join(timeout=3.0)
-        self._vad.close()
+        self._q.put(_SHUTDOWN_SENTINEL)
+        self._worker.join()
+        with self._lock:
+            if self._vad:
+                self._vad.close()
+                self._vad = None
 
 
 # ── WebSocket handler ───────────────────────────────────────────────────────
@@ -392,18 +419,15 @@ async def ws_handler(request):
     refs_dir: Path = request.app["refs_dir"]
 
     session = tts.create_session()
-    out_q: queue.Queue = queue.Queue()
-    pipeline = LoopbackPipeline(tts, session, out_q, refs_dir)
+    loop = asyncio.get_running_loop()
+    out_q: asyncio.Queue = asyncio.Queue(maxsize=256)
+    pipeline = LoopbackPipeline(tts, session, out_q, refs_dir, loop)
 
     async def drain():
-        loop = asyncio.get_running_loop()
         while True:
-            try:
-                msg = await loop.run_in_executor(None, out_q.get, True, 0.2)
-            except queue.Empty:
-                if ws.closed:
-                    return
-                continue
+            msg = await out_q.get()
+            if msg is None:
+                return
             try:
                 await ws.send_json(msg)
             except Exception:
@@ -431,12 +455,13 @@ async def ws_handler(request):
             elif t == "config":
                 pipeline.set_params(data.get("params", {}))
             elif t == "reset":
-                pipeline.reset()
+                pipeline.request_reset()
                 await ws.send_json({"type": "reset_ack"})
             else:
                 await ws.send_json({"type": "error", "message": f"unknown type: {t}"})
     finally:
         pipeline.close()
+        out_q.put_nowait(None)
         drain_task.cancel()
         try:
             await drain_task

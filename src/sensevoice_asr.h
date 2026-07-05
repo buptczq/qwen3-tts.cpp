@@ -218,13 +218,20 @@ static inline std::vector<int> run_seg(const model& m, const int* qtok, int nq,
   std::vector<float> inp((size_t)Na*F, 0.0f); // zero-padded to N_alloc
   for(int i=0;i<nq;i++) memcpy(&inp[(size_t)i*F], &emb[qtok[i]*F], F*sizeof(float));
   memcpy(&inp[(size_t)nq*F], fb.data(), (size_t)T*F*sizeof(float));
+  // Pad trailing rows with a copy of the last real frame (instead of zeros)
+  // to avoid boundary artifacts from the SAN-M FSMN conv-left kernel.
+  if(Na > N){
+    const float* last_row = &inp[(size_t)(N-1)*F];
+    for(int i=N;i<Na;i++) memcpy(&inp[(size_t)i*F], last_row, F*sizeof(float));
+  }
   float sc=sqrtf((float)D); for(int i=0;i<N*F;i++) inp[i]*=sc;
   add_posenc(inp,N,F); // posenc only for real N positions
 
   ggml_gallocr_alloc_graph(ga,m.gf_p);
   int64_t t2=t_us();
   ggml_backend_tensor_set(m.x_p,inp.data(),0,ggml_nbytes(m.x_p));
-  ggml_backend_cpu_set_n_threads(be,nthreads);
+  // Threadpool is persistent (set via ggml_backend_cpu_set_threadpool at creation).
+  // No need to call set_n_threads every call.
   int64_t t3=t_us();
   std::vector<int> seg_ids;
   if(ggml_backend_graph_compute(be,m.gf_p)==GGML_STATUS_SUCCESS){
