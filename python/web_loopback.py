@@ -25,7 +25,6 @@ import queue
 import sys
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -316,17 +315,14 @@ class LoopbackPipeline:
                 return
 
             ref_name = params_snapshot.get("ref_name")
-            ref_path: Optional[str] = None
+            ref_wav_bytes: Optional[bytes] = None
             ref_text: Optional[str] = None
             if ref_name and self._refs_dir:
                 ref_file = self._refs_dir / f"{ref_name}.json"
                 if ref_file.exists():
                     try:
                         data = json.loads(ref_file.read_text("utf-8"))
-                        wav_bytes = base64.b64decode(data["wav_base64"])
-                        tmp = self._refs_dir / f"_{uuid.uuid4().hex}.wav"
-                        tmp.write_bytes(wav_bytes)
-                        ref_path = str(tmp)
+                        ref_wav_bytes = base64.b64decode(data["wav_base64"])
                         ref_text = data.get("reference_text") or None
                     except Exception as exc:
                         logger.warning("ref '%s' load failed: %s", ref_name, exc)
@@ -359,9 +355,9 @@ class LoopbackPipeline:
                 seg_id, text, ref_name or "none", tts_params.get("max_audio_tokens", 0),
             )
             try:
-                if ref_path:
-                    self._tts.synthesize_with_voice_streaming_session(
-                        self._session, text, ref_path,
+                if ref_wav_bytes:
+                    self._tts.synthesize_with_voice_streaming_session_bytes(
+                        self._session, text, ref_wav_bytes,
                         on_audio_chunk=on_chunk,
                         reference_text=ref_text,
                         **tts_params,
@@ -380,12 +376,6 @@ class LoopbackPipeline:
                     "message": f"TTS failed: {exc}",
                 })
                 return
-            finally:
-                if ref_path:
-                    try:
-                        Path(ref_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
 
             tts_ms = (time.perf_counter() - t_tts) * 1000
             out_dur_ms = total_samples[0] / SAMPLE_RATE_TTS * 1000 if total_samples[0] else 0

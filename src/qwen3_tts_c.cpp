@@ -226,6 +226,68 @@ qwen3_tts_result_t qwen3_tts_synthesize_with_voice_streaming(
     return convert_result(result);
 }
 
+// Helper: parse an in-memory WAV buffer into 24kHz mono PCM samples.
+// Returns false on failure.
+static bool reference_wav_to_pcm_24k(const void* wav_data, int32_t wav_size,
+                                     std::vector<float> & out) {
+    std::vector<float> ref_samples;
+    int ref_sample_rate = 0;
+    if (!qwen3_tts::load_audio_from_memory(wav_data, (size_t)wav_size,
+                                           ref_samples, ref_sample_rate)) {
+        return false;
+    }
+    const int target_rate = 24000;
+    if (ref_sample_rate != target_rate) {
+        fprintf(stderr, "Resampling reference audio from %d Hz to %d Hz...\n",
+                ref_sample_rate, target_rate);
+        std::vector<float> resampled;
+        qwen3_tts::pipeline_internal::resample_linear(ref_samples.data(), (int)ref_samples.size(),
+                                          ref_sample_rate, resampled, target_rate);
+        out = std::move(resampled);
+    } else {
+        out = std::move(ref_samples);
+    }
+    return true;
+}
+
+qwen3_tts_result_t qwen3_tts_synthesize_with_voice_streaming_bytes(
+    qwen3_tts_context_t* ctx,
+    const char* text,
+    const void* reference_wav_data,
+    int32_t reference_wav_size,
+    const char* reference_text,
+    qwen3_tts_streaming_params_t params,
+    qwen3_tts_audio_chunk_callback callback,
+    void* user_data
+) {
+    if (!ctx || !text || !reference_wav_data || reference_wav_size <= 0 || !callback) {
+        qwen3_tts_result_t res = {0};
+        res.success = 0;
+        res.error_msg = strdup("Invalid context, text, reference wav, or streaming callback");
+        return res;
+    }
+
+    std::vector<float> ref_pcm;
+    if (!reference_wav_to_pcm_24k(reference_wav_data, reference_wav_size, ref_pcm)) {
+        qwen3_tts_result_t res = {0};
+        res.success = 0;
+        res.error_msg = strdup("Failed to parse reference WAV buffer");
+        return res;
+    }
+
+    qwen3_tts::tts_audio_chunk_callback_t cb =
+        [callback, user_data](const float* samples, int32_t n_samples, int32_t sample_rate) {
+            return callback(samples, n_samples, sample_rate, user_data) != 0;
+        };
+    auto sp = convert_streaming_params(params);
+    if (reference_text) {
+        sp.generation.reference_text = reference_text;
+    }
+    auto result = ctx->tts.synthesize_with_voice_streaming(
+        text, ref_pcm.data(), (int32_t)ref_pcm.size(), cb, sp);
+    return convert_result(result);
+}
+
 qwen3_tts_result_t qwen3_tts_synthesize_with_speaker_embedding_streaming(
     qwen3_tts_context_t* ctx,
     const char* text,
@@ -925,6 +987,46 @@ qwen3_tts_result_t qwen3_tts_session_synthesize_with_voice_streaming(
         sp.generation.reference_text = reference_text;
     }
     auto result = ctx->tts.synthesize_with_voice_streaming(*session->session, text, reference_audio, cb, sp);
+    return convert_result(result);
+}
+
+qwen3_tts_result_t qwen3_tts_session_synthesize_with_voice_streaming_bytes(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    const void* reference_wav_data,
+    int32_t reference_wav_size,
+    const char* reference_text,
+    qwen3_tts_streaming_params_t params,
+    qwen3_tts_audio_chunk_callback callback,
+    void* user_data
+) {
+    if (!ctx || !session || !session->session || !text ||
+        !reference_wav_data || reference_wav_size <= 0 || !callback) {
+        qwen3_tts_result_t res;
+        std::memset(&res, 0, sizeof(res));
+        res.error_msg = strdup("Invalid context, session, text, reference wav, or callback");
+        return res;
+    }
+
+    std::vector<float> ref_pcm;
+    if (!reference_wav_to_pcm_24k(reference_wav_data, reference_wav_size, ref_pcm)) {
+        qwen3_tts_result_t res;
+        std::memset(&res, 0, sizeof(res));
+        res.error_msg = strdup("Failed to parse reference WAV buffer");
+        return res;
+    }
+
+    qwen3_tts::tts_audio_chunk_callback_t cb =
+        [callback, user_data](const float* samples, int32_t n_samples, int32_t sample_rate) {
+            return callback(samples, n_samples, sample_rate, user_data) != 0;
+        };
+    auto sp = convert_streaming_params(params);
+    if (reference_text) {
+        sp.generation.reference_text = reference_text;
+    }
+    auto result = ctx->tts.synthesize_with_voice_streaming(
+        *session->session, text, ref_pcm.data(), (int32_t)ref_pcm.size(), cb, sp);
     return convert_result(result);
 }
 

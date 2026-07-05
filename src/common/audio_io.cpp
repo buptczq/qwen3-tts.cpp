@@ -16,130 +16,119 @@ bool load_audio_file(const std::string & path, std::vector<float> & samples,
         return false;
     }
 
-    // Read RIFF header
-    char riff[4];
-    if (fread(riff, 1, 4, f) != 4 || strncmp(riff, "RIFF", 4) != 0) {
+    // Read the whole file into memory, then parse with load_audio_from_memory.
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz <= 0) {
+        fprintf(stderr, "ERROR: Empty WAV file: %s\n", path.c_str());
+        fclose(f);
+        return false;
+    }
+    fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> buf((size_t)sz);
+    if (fread(buf.data(), 1, (size_t)sz, f) != (size_t)sz) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    return load_audio_from_memory(buf.data(), buf.size(), samples, sample_rate);
+}
+
+// Parse a WAV byte buffer (16/32-bit PCM or 32-bit float) into mono float
+// samples. Multi-channel input is downmixed to mono by averaging channels.
+bool load_audio_from_memory(const void * data, size_t data_size,
+                            std::vector<float> & samples, int & sample_rate) {
+    samples.clear();
+    sample_rate = 0;
+    if (!data || data_size < 44) return false;
+    const uint8_t * p = (const uint8_t *)data;
+    const uint8_t * end = p + data_size;
+
+    auto read_u16 = [&](const uint8_t * q) -> uint16_t {
+        return (uint16_t)(q[0] | (q[1] << 8));
+    };
+    auto read_u32 = [&](const uint8_t * q) -> uint32_t {
+        return (uint32_t)(q[0] | (q[1] << 8) | (q[2] << 16) | (q[3] << 24));
+    };
+
+    if (memcmp(p, "RIFF", 4) != 0) {
         fprintf(stderr, "ERROR: Not a RIFF file\n");
-        fclose(f);
         return false;
     }
-
-    uint32_t file_size;
-    if (fread(&file_size, 4, 1, f) != 1) {
-        fclose(f);
-        return false;
-    }
-
-    char wave[4];
-    if (fread(wave, 1, 4, f) != 4 || strncmp(wave, "WAVE", 4) != 0) {
+    p += 8;  // skip RIFF + file_size
+    if (memcmp(p, "WAVE", 4) != 0) {
         fprintf(stderr, "ERROR: Not a WAVE file\n");
-        fclose(f);
         return false;
     }
+    p += 4;
 
-    // Find fmt and data chunks
     uint16_t audio_format = 0;
     uint16_t num_channels = 0;
     uint32_t sr = 0;
     uint16_t bits_per_sample = 0;
 
-    while (!feof(f)) {
-        char chunk_id[4];
-        uint32_t chunk_size;
+    while (p + 8 <= end) {
+        uint32_t chunk_size = read_u32(p + 4);
+        const uint8_t * chunk_data = p + 8;
+        if (chunk_data + chunk_size > end) chunk_size = (uint32_t)(end - chunk_data);
 
-        if (fread(chunk_id, 1, 4, f) != 4) break;
-        if (fread(&chunk_size, 4, 1, f) != 1) break;
-
-        if (strncmp(chunk_id, "fmt ", 4) == 0) {
-            if (fread(&audio_format, 2, 1, f) != 1) break;
-            if (fread(&num_channels, 2, 1, f) != 1) break;
-            if (fread(&sr, 4, 1, f) != 1) break;
-            fseek(f, 6, SEEK_CUR);  // Skip byte rate and block align
-            if (fread(&bits_per_sample, 2, 1, f) != 1) break;
-
-            // Skip any extra format bytes
-            if (chunk_size > 16) {
-                fseek(f, chunk_size - 16, SEEK_CUR);
-            }
-        } else if (strncmp(chunk_id, "data", 4) == 0) {
-            sample_rate = sr;
+        if (memcmp(p, "fmt ", 4) == 0) {
+            if (chunk_size < 16) return false;
+            audio_format     = read_u16(chunk_data + 0);
+            num_channels     = read_u16(chunk_data + 2);
+            sr               = read_u32(chunk_data + 4);
+            bits_per_sample  = read_u16(chunk_data + 14);
+        } else if (memcmp(p, "data", 4) == 0) {
+            sample_rate = (int)sr;
 
             if (audio_format == 1) {  // PCM
                 if (bits_per_sample == 16) {
-                    int n_samples = chunk_size / (2 * num_channels);
-                    samples.resize(n_samples);
-
-                    std::vector<int16_t> raw(n_samples * num_channels);
-                    if (fread(raw.data(), 2, n_samples * num_channels, f) != (size_t) (n_samples * num_channels)) {
-                        fclose(f);
-                        return false;
-                    }
-
-                    // Convert to mono float
-                    for (int i = 0; i < n_samples; ++i) {
+                    int n = (int)(chunk_size / (2 * num_channels));
+                    samples.resize(n);
+                    const int16_t * raw = (const int16_t *)chunk_data;
+                    for (int i = 0; i < n; ++i) {
                         float sum = 0.0f;
-                        for (int c = 0; c < num_channels; ++c) {
+                        for (int c = 0; c < num_channels; ++c)
                             sum += raw[i * num_channels + c] / 32768.0f;
-                        }
                         samples[i] = sum / num_channels;
                     }
                 } else if (bits_per_sample == 32) {
-                    int n_samples = chunk_size / (4 * num_channels);
-                    samples.resize(n_samples);
-
-                    std::vector<int32_t> raw(n_samples * num_channels);
-                    if (fread(raw.data(), 4, n_samples * num_channels, f) != (size_t) (n_samples * num_channels)) {
-                        fclose(f);
-                        return false;
-                    }
-
-                    // Convert to mono float
-                    for (int i = 0; i < n_samples; ++i) {
+                    int n = (int)(chunk_size / (4 * num_channels));
+                    samples.resize(n);
+                    const int32_t * raw = (const int32_t *)chunk_data;
+                    for (int i = 0; i < n; ++i) {
                         float sum = 0.0f;
-                        for (int c = 0; c < num_channels; ++c) {
+                        for (int c = 0; c < num_channels; ++c)
                             sum += raw[i * num_channels + c] / 2147483648.0f;
-                        }
                         samples[i] = sum / num_channels;
                     }
                 } else {
                     fprintf(stderr, "ERROR: Unsupported bits per sample: %d\n", bits_per_sample);
-                    fclose(f);
                     return false;
                 }
             } else if (audio_format == 3) {  // IEEE float
-                int n_samples = chunk_size / (4 * num_channels);
-                samples.resize(n_samples);
-
-                std::vector<float> raw(n_samples * num_channels);
-                if (fread(raw.data(), 4, n_samples * num_channels, f) != (size_t) (n_samples * num_channels)) {
-                    fclose(f);
-                    return false;
-                }
-
-                // Convert to mono
-                for (int i = 0; i < n_samples; ++i) {
+                int n = (int)(chunk_size / (4 * num_channels));
+                samples.resize(n);
+                const float * raw = (const float *)chunk_data;
+                for (int i = 0; i < n; ++i) {
                     float sum = 0.0f;
-                    for (int c = 0; c < num_channels; ++c) {
+                    for (int c = 0; c < num_channels; ++c)
                         sum += raw[i * num_channels + c];
-                    }
                     samples[i] = sum / num_channels;
                 }
             } else {
                 fprintf(stderr, "ERROR: Unsupported audio format: %d\n", audio_format);
-                fclose(f);
                 return false;
             }
-
-            fclose(f);
             return true;
-        } else {
-            // Skip unknown chunk
-            fseek(f, chunk_size, SEEK_CUR);
         }
+        // advance to next chunk (chunk_size + padding to even)
+        size_t adv = 8 + chunk_size + (chunk_size & 1);
+        if (p + adv > end) break;
+        p += adv;
     }
 
     fprintf(stderr, "ERROR: No data chunk found\n");
-    fclose(f);
     return false;
 }
 

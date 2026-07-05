@@ -241,6 +241,12 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
         _AudioChunkCallback, _void_ptr,
     ]
 
+    lib.qwen3_tts_synthesize_with_voice_streaming_bytes.restype = _TtsResult
+    lib.qwen3_tts_synthesize_with_voice_streaming_bytes.argtypes = [
+        _void_ptr, _char_ptr, _void_ptr, _int32, _char_ptr, _TtsStreamingParams,
+        _AudioChunkCallback, _void_ptr,
+    ]
+
     lib.qwen3_tts_synthesize_with_speaker_embedding_streaming.restype = _TtsResult
     lib.qwen3_tts_synthesize_with_speaker_embedding_streaming.argtypes = [
         _void_ptr, _char_ptr, _char_ptr, _TtsStreamingParams,
@@ -376,6 +382,19 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
         _void_ptr,  # session
         _char_ptr,  # text
         _char_ptr,  # reference_audio
+        _char_ptr,  # reference_text
+        _TtsStreamingParams,  # params
+        _AudioChunkCallback,  # callback
+        _void_ptr,  # user_data
+    ]
+
+    lib.qwen3_tts_session_synthesize_with_voice_streaming_bytes.restype = _TtsResult
+    lib.qwen3_tts_session_synthesize_with_voice_streaming_bytes.argtypes = [
+        _void_ptr,  # ctx
+        _void_ptr,  # session
+        _char_ptr,  # text
+        _void_ptr,  # reference_wav_data
+        _int32,     # reference_wav_size
         _char_ptr,  # reference_text
         _TtsStreamingParams,  # params
         _AudioChunkCallback,  # callback
@@ -640,6 +659,27 @@ class Qwen3TTS:
             params=params,
         )
 
+    def synthesize_with_voice_streaming_bytes(
+        self,
+        text: str,
+        reference_wav_bytes: bytes,
+        on_audio_chunk: Callable[[np.ndarray, int], bool],
+        reference_text: Optional[str] = None,
+        **params,
+    ) -> tuple:
+        """Streaming synthesis with voice cloning from an in-memory WAV buffer.
+
+        ``reference_wav_bytes`` is the raw contents of a WAV file (16/32-bit
+        PCM or 32-bit float). Avoids creating a temporary file.
+        """
+        return self._streaming_impl_bytes(
+            self._lib.qwen3_tts_synthesize_with_voice_streaming_bytes,
+            text, on_audio_chunk,
+            reference_wav_bytes=reference_wav_bytes,
+            reference_text=reference_text,
+            params=params,
+        )
+
     def synthesize_with_speaker_embedding_streaming(
         self,
         text: str,
@@ -698,6 +738,47 @@ class Qwen3TTS:
         res = c_api_func(*c_args)
         return self._result_to_numpy(res)
 
+    def _streaming_impl_bytes(self, c_api_func, text, on_audio_chunk,
+                             reference_wav_bytes, reference_text=None, params=None):
+        """Streaming path for in-memory WAV reference bytes."""
+        sp = self._build_streaming_params(**(params or {}))
+
+        abort_flag = [False]
+
+        @_AudioChunkCallback
+        def _c_callback(samples_ptr, n_samples, sample_rate, user_data):
+            if abort_flag[0]:
+                return 0
+            if n_samples <= 0:
+                return 1
+            buf = (ctypes.c_float * n_samples).from_address(
+                ctypes.addressof(samples_ptr.contents)
+            )
+            arr = np.frombuffer(buf, dtype=np.float32).copy()
+            try:
+                cont = on_audio_chunk(arr, sample_rate)
+            except Exception:
+                abort_flag[0] = True
+                return 0
+            if not cont:
+                abort_flag[0] = True
+                return 0
+            return 1
+
+        text_enc = text.encode("utf-8")
+        ref_text_enc = reference_text.encode("utf-8") if reference_text else None
+        wav_buf = bytes(reference_wav_bytes)
+        wav_size = len(wav_buf)
+        # Pin the wav buffer to a ctypes array so it stays alive during the call.
+        wav_arr = (ctypes.c_ubyte * wav_size).from_buffer_copy(wav_buf)
+
+        res = c_api_func(
+            self._ctx, text_enc,
+            ctypes.cast(wav_arr, ctypes.c_void_p), wav_size,
+            ref_text_enc, sp, _c_callback, None,
+        )
+        return self._result_to_numpy(res)
+
     # ── session-aware streaming synthesis ──────────────────────────────
 
     def synthesize_streaming_session(
@@ -737,6 +818,24 @@ class Qwen3TTS:
             self._lib.qwen3_tts_session_synthesize_with_voice_streaming,
             session, text, on_audio_chunk,
             extra_args=(str(reference_audio), reference_text),
+            params=params,
+        )
+
+    def synthesize_with_voice_streaming_session_bytes(
+        self,
+        session: Qwen3TTSSession,
+        text: str,
+        reference_wav_bytes: bytes,
+        on_audio_chunk: Callable[[np.ndarray, int], bool],
+        reference_text: Optional[str] = None,
+        **params,
+    ) -> tuple:
+        """Session-aware streaming voice cloning from an in-memory WAV buffer."""
+        return self._streaming_impl_session_bytes(
+            self._lib.qwen3_tts_session_synthesize_with_voice_streaming_bytes,
+            session, text, on_audio_chunk,
+            reference_wav_bytes=reference_wav_bytes,
+            reference_text=reference_text,
             params=params,
         )
 
@@ -782,6 +881,46 @@ class Qwen3TTS:
         c_args.extend([sp, _c_callback, None])
 
         res = c_api_func(*c_args)
+        return self._result_to_numpy(res)
+
+    def _streaming_impl_session_bytes(self, c_api_func, session, text, on_audio_chunk,
+                                      reference_wav_bytes, reference_text=None, params=None):
+        """Session-aware streaming path for in-memory WAV reference bytes."""
+        sp = self._build_streaming_params(**(params or {}))
+
+        abort_flag = [False]
+
+        @_AudioChunkCallback
+        def _c_callback(samples_ptr, n_samples, sample_rate, user_data):
+            if abort_flag[0]:
+                return 0
+            if n_samples <= 0:
+                return 1
+            buf = (ctypes.c_float * n_samples).from_address(
+                ctypes.addressof(samples_ptr.contents)
+            )
+            arr = np.frombuffer(buf, dtype=np.float32).copy()
+            try:
+                cont = on_audio_chunk(arr, sample_rate)
+            except Exception:
+                abort_flag[0] = True
+                return 0
+            if not cont:
+                abort_flag[0] = True
+                return 0
+            return 1
+
+        text_enc = text.encode("utf-8")
+        ref_text_enc = reference_text.encode("utf-8") if reference_text else None
+        wav_buf = bytes(reference_wav_bytes)
+        wav_size = len(wav_buf)
+        wav_arr = (ctypes.c_ubyte * wav_size).from_buffer_copy(wav_buf)
+
+        res = c_api_func(
+            self._ctx, session._session, text_enc,
+            ctypes.cast(wav_arr, ctypes.c_void_p), wav_size,
+            ref_text_enc, sp, _c_callback, None,
+        )
         return self._result_to_numpy(res)
 
     # ── utility ─────────────────────────────────────────────────────────

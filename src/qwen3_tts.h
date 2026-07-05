@@ -347,6 +347,11 @@ private:
 bool load_audio_file(const std::string & path, std::vector<float> & samples, 
                      int & sample_rate);
 
+// Utility: Load audio from an in-memory WAV byte buffer (same formats as
+// load_audio_file: 16/32-bit PCM or 32-bit float, mono or multi-channel).
+bool load_audio_from_memory(const void * data, size_t data_size,
+                            std::vector<float> & samples, int & sample_rate);
+
 // Utility: Save audio file (WAV format)
 bool save_audio_file(const std::string & path, const std::vector<float> & samples,
                      int sample_rate);

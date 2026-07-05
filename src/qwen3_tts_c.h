@@ -123,6 +123,20 @@ QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_synthesize_with_voice_streaming(
     void* user_data
 );
 
+// Like qwen3_tts_synthesize_with_voice_streaming but takes the reference WAV
+// as an in-memory byte buffer (avoids creating a temporary file). The buffer
+// contents follow the same WAV formats as load_audio_file.
+QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_synthesize_with_voice_streaming_bytes(
+    qwen3_tts_context_t* ctx,
+    const char* text,
+    const void* reference_wav_data,
+    int32_t reference_wav_size,
+    const char* reference_text,
+    qwen3_tts_streaming_params_t params,
+    qwen3_tts_audio_chunk_callback callback,
+    void* user_data
+);
+
 QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_synthesize_with_speaker_embedding_streaming(
     qwen3_tts_context_t* ctx,
     const char* text,
@@ -174,6 +188,19 @@ QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_session_synthesize_with_voice_streami
     qwen3_tts_session_t* session,
     const char* text,
     const char* reference_audio,
+    const char* reference_text,
+    qwen3_tts_streaming_params_t params,
+    qwen3_tts_audio_chunk_callback callback,
+    void* user_data);
+
+// Like qwen3_tts_session_synthesize_with_voice_streaming but takes the
+// reference WAV as an in-memory byte buffer.
+QWEN3_TTS_API qwen3_tts_result_t qwen3_tts_session_synthesize_with_voice_streaming_bytes(
+    qwen3_tts_context_t* ctx,
+    qwen3_tts_session_t* session,
+    const char* text,
+    const void* reference_wav_data,
+    int32_t reference_wav_size,
     const char* reference_text,
     qwen3_tts_streaming_params_t params,
     qwen3_tts_audio_chunk_callback callback,

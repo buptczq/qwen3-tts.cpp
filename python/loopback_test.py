@@ -46,7 +46,8 @@ TEST_SENTENCES = [
 
 
 def measure_tts_vad_streaming(tts: Qwen3TTS, text: str, max_seg_ms: int = 30000,
-                            vad_params=None) -> Tuple[np.ndarray, int, List[dict], float, float, float]:
+                            vad_params=None, tts_params=None,
+                            ref_wav_bytes=None, ref_text=None) -> Tuple[np.ndarray, int, List[dict], float, float, float]:
     """Run streaming TTS -> VAD pipeline.
 
     TTS generates audio chunks which are immediately fed to VAD.
@@ -95,9 +96,13 @@ def measure_tts_vad_streaming(tts: Qwen3TTS, text: str, max_seg_ms: int = 30000,
         return True  # continue
 
     # Run streaming TTS
-    success, audio, sr, err, t_ms = tts.synthesize_streaming(
-        text, on_audio_chunk, collect_audio=True
-    )
+    tp = dict(tts_params or {})
+    if ref_wav_bytes:
+        success, audio, sr, err, t_ms = tts.synthesize_with_voice_streaming_bytes(
+            text, ref_wav_bytes, on_audio_chunk, reference_text=ref_text, collect_audio=True, **tp)
+    else:
+        success, audio, sr, err, t_ms = tts.synthesize_streaming(
+            text, on_audio_chunk, collect_audio=True, **tp)
     tts_total_ms = (time.perf_counter() - tts_start) * 1000
 
     if not success:
@@ -166,7 +171,8 @@ def simple_cer(reference: str, hypothesis: str) -> float:
     return 1.0 - (matches / max_len) if max_len > 0 else 0.0
 
 
-def run_concurrent_test(tts: Qwen3TTS, n_threads: int, rounds: int, vad_params=None):
+def run_concurrent_test(tts: Qwen3TTS, n_threads: int, rounds: int, vad_params=None,
+                    tts_params=None, ref_wav_bytes=None, ref_text=None):
     """Run TTS->VAD->ASR pipeline concurrently from multiple threads.
 
     Each thread gets its own session and processes a subset of sentences.
@@ -189,7 +195,9 @@ def run_concurrent_test(tts: Qwen3TTS, n_threads: int, rounds: int, vad_params=N
                 label = f"[T{thread_id}] iter={iteration+1} sent={sent_idx+1}/{len(my_sentences)}"
                 try:
                     audio, sr, segments, first_chunk_ms, tts_ms, vad_ms = \
-                        measure_tts_vad_streaming_session(tts, session, text, vad_params=vad_params)
+                        measure_tts_vad_streaming_session(
+                            tts, session, text, vad_params=vad_params,
+                            tts_params=tts_params, ref_wav_bytes=ref_wav_bytes, ref_text=ref_text)
                     audio_duration_ms = len(audio) / sr * 1000
 
                     asr_texts = []
@@ -255,7 +263,8 @@ def run_concurrent_test(tts: Qwen3TTS, n_threads: int, rounds: int, vad_params=N
     return 0 if avg_cer < 0.3 else 1
 
 
-def measure_tts_vad_streaming_session(tts, session, text, max_seg_ms=30000, vad_params=None):
+def measure_tts_vad_streaming_session(tts, session, text, max_seg_ms=30000, vad_params=None,
+                                    tts_params=None, ref_wav_bytes=None, ref_text=None):
     """Session-aware variant of measure_tts_vad_streaming."""
     vad_stream = tts.create_vad_stream(max_seg_ms=max_seg_ms, vad_params=vad_params)
     audio_chunks = []
@@ -284,9 +293,14 @@ def measure_tts_vad_streaming_session(tts, session, text, max_seg_ms=30000, vad_
         vad_time += (time.perf_counter() - vad_start) * 1000
         return True
 
-    success, audio, sr, err, t_ms = tts.synthesize_streaming_session(
-        session, text, on_audio_chunk, collect_audio=True
-    )
+    success, audio, sr, err, t_ms = (None, None, 0, "", 0)
+    tp = dict(tts_params or {})
+    if ref_wav_bytes:
+        success, audio, sr, err, t_ms = tts.synthesize_with_voice_streaming_session_bytes(
+            session, text, ref_wav_bytes, on_audio_chunk, reference_text=ref_text, collect_audio=True, **tp)
+    else:
+        success, audio, sr, err, t_ms = tts.synthesize_streaming_session(
+            session, text, on_audio_chunk, collect_audio=True, **tp)
     tts_total_ms = (time.perf_counter() - tts_start) * 1000
 
     if not success:
@@ -304,7 +318,8 @@ def measure_tts_vad_streaming_session(tts, session, text, max_seg_ms=30000, vad_
     return full_audio, sample_rate[0], segments, first_chunk_ms, tts_total_ms, vad_time
 
 
-def run_loopback_test(args, vad_params=None):
+def run_loopback_test(args, vad_params=None, tts_params=None,
+                     ref_wav_bytes=None, ref_text=None):
     """Run the full loopback test with multiple rounds."""
     print("=" * 70)
     print("Loopback Test: TTS -> VAD -> ASR -> TTS -> VAD -> ASR ...")
@@ -352,7 +367,9 @@ def run_loopback_test(args, vad_params=None):
                 print(f"\n    Round {round_num + 1}/{args.rounds}: \"{current_text}\"")
 
                 # Step 1+2: Streaming TTS -> VAD (overlapped)
-                audio, sr, segments, first_chunk_ms, tts_total_ms, vad_ms = measure_tts_vad_streaming(tts, current_text, vad_params=vad_params)
+                audio, sr, segments, first_chunk_ms, tts_total_ms, vad_ms = measure_tts_vad_streaming(
+                    tts, current_text, vad_params=vad_params, tts_params=tts_params,
+                    ref_wav_bytes=ref_wav_bytes, ref_text=ref_text)
                 audio_duration_ms = len(audio) / sr * 1000
                 print(f"      TTS: first_chunk={first_chunk_ms:.1f}ms, total={tts_total_ms:.1f}ms (audio: {audio_duration_ms:.0f}ms, RTF: {compute_rtf(audio_duration_ms, tts_total_ms):.3f})")
                 print(f"      VAD: {vad_ms:.1f}ms, {len(segments)} segments")
@@ -477,7 +494,9 @@ def run_loopback_test(args, vad_params=None):
         print("\n" + "=" * 70)
         print(f"Concurrent Test: {args.concurrent} threads")
         print("=" * 70)
-        concurrent_ok = run_concurrent_test(tts, args.concurrent, args.rounds, vad_params=vad_params) == 0
+        concurrent_ok = run_concurrent_test(tts, args.concurrent, args.rounds,
+                                           vad_params=vad_params, tts_params=tts_params,
+                                           ref_wav_bytes=ref_wav_bytes, ref_text=ref_text) == 0
 
     print("\nCleaning up...")
     tts.free_asr_model()
@@ -502,6 +521,14 @@ def main():
                         help="Max speech duration in seconds before auto-split (default 30.0)")
     parser.add_argument("--vad-speech-pad-ms", type=int, default=None,
                         help="Padding in ms applied to each speech segment (default 30)")
+    parser.add_argument("--ref", default=None,
+                        help="Reference audio JSON (voice clone); format: {wav_base64, reference_text}")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="TTS sampling temperature (default 0.7; use 0 for greedy)")
+    parser.add_argument("--top-p", type=float, default=0.9, help="TTS top-p (default 0.9)")
+    parser.add_argument("--top-k", type=int, default=50, help="TTS top-k (default 50)")
+    parser.add_argument("--max-audio-tokens", type=int, default=256,
+                        help="Max audio tokens to generate per sentence (default 256)")
     parser.add_argument("--iterations", type=int, default=1, help="Number of test iterations")
     parser.add_argument("--rounds", type=int, default=3, help="Number of TTS->VAD->ASR rounds per sentence (default: 3)")
     parser.add_argument("--concurrent", type=int, default=0, metavar="N",
@@ -528,7 +555,26 @@ def main():
         speech_pad_ms=args.vad_speech_pad_ms,
     )
 
-    return run_loopback_test(args, vad_params)
+    # Load reference audio for voice cloning (if provided).
+    ref_wav_bytes = None
+    ref_text = None
+    if args.ref:
+        import json, base64
+        with open(args.ref) as f:
+            d = json.load(f)
+        ref_wav_bytes = base64.b64decode(d["wav_base64"])
+        ref_text = d.get("reference_text") or None
+        print(f"Loaded reference: {d.get('name', args.ref)} ref_text={ref_text!r} wav_bytes={len(ref_wav_bytes)}")
+
+    tts_params = {
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "max_audio_tokens": args.max_audio_tokens,
+    }
+
+    return run_loopback_test(args, vad_params, tts_params=tts_params,
+                             ref_wav_bytes=ref_wav_bytes, ref_text=ref_text)
 
 
 if __name__ == "__main__":
