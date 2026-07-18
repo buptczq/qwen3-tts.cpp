@@ -94,6 +94,8 @@ class AsrPipeline:
         self._llm_model = llm_model
         self._system_prompt = system_prompt
         self._http_session = http_session
+        self._context_enabled = False
+        self._history: list[dict] = []
 
     def set_params(self, params: dict) -> None:
         with self._lock:
@@ -114,6 +116,11 @@ class AsrPipeline:
                 self._trimmed_offset = 0
             if "system_prompt" in params:
                 self._system_prompt = params["system_prompt"]
+            if "context_enabled" in params:
+                enabled = bool(params["context_enabled"])
+                self._context_enabled = enabled
+                if not enabled:
+                    self._history.clear()
 
     def _put_out(self, msg: dict) -> None:
         try:
@@ -260,6 +267,8 @@ class AsrPipeline:
         messages = []
         if self._system_prompt:
             messages.append({"role": "system", "content": self._system_prompt})
+        if self._context_enabled:
+            messages.extend(self._history)
         messages.append({"role": "user", "content": question})
 
         payload = {
@@ -313,14 +322,28 @@ class AsrPipeline:
                 "segment_id": seg_id,
                 "latency_ms": llm_ms,
             })
+            if self._context_enabled and accumulated.strip():
+                self._history.append({"role": "user", "content": question})
+                self._history.append({"role": "assistant", "content": accumulated})
         except Exception as exc:
             logger.error("LLM call failed: %s", exc, exc_info=True)
-            self._put_out({
-                "type": "llm_answer",
-                "segment_id": seg_id,
-                "text": f"Error: {exc}",
-                "error": True,
-            })
+            if accumulated:
+                llm_ms = (time.perf_counter() - t_llm) * 1000
+                self._put_out({
+                    "type": "llm_done",
+                    "segment_id": seg_id,
+                    "latency_ms": llm_ms,
+                })
+                if self._context_enabled and accumulated.strip():
+                    self._history.append({"role": "user", "content": question})
+                    self._history.append({"role": "assistant", "content": accumulated})
+            else:
+                self._put_out({
+                    "type": "llm_answer",
+                    "segment_id": seg_id,
+                    "text": f"Error: {exc}",
+                    "error": True,
+                })
 
     def _reset_pipeline(self) -> None:
         with self._lock:
@@ -340,6 +363,8 @@ class AsrPipeline:
                 break
 
     def request_reset(self) -> None:
+        with self._lock:
+            self._history.clear()
         self._q.put(_RESET_SENTINEL)
 
     def close(self) -> None:
@@ -512,6 +537,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <button class="btn btn-primary" id="btn-start">Start Mic</button>
   <button class="btn btn-danger" id="btn-stop" disabled>Stop</button>
   <button class="btn btn-secondary" id="btn-reset">Reset</button>
+  <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:#374151;cursor:pointer;">
+    <input type="checkbox" id="ctx-toggle"> Context
+  </label>
   <span class="badge badge-idle" id="live-badge">IDLE</span>
   <div id="mic-meter"><div class="fill"></div></div>
 </div>
@@ -642,6 +670,7 @@ function sendConfig() {
     ws.send(JSON.stringify({
       type: "config",
       params: {
+        context_enabled: document.getElementById("ctx-toggle").checked,
         system_prompt: document.getElementById("sys-prompt").value,
         vad_params: {
           threshold: 0.5,
@@ -742,6 +771,7 @@ document.getElementById("btn-reset").onclick = () => {
   for (const k of Object.keys(segState)) delete segState[k];
 };
 document.getElementById("sys-prompt").onchange = sendConfig;
+document.getElementById("ctx-toggle").onchange = sendConfig;
 
 connectWs();
 </script>
